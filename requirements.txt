@@ -1,6 +1,2 @@
 streamlit
-pandas
-openpyxl
-requests
-beautifulsoup4
-ddgs
+openai
