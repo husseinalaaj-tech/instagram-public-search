@@ -6,7 +6,7 @@ import random
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -15,66 +15,56 @@ import streamlit as st
 
 try:
     from ddgs import DDGS
-    from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
+    from ddgs.exceptions import (
+        DDGSException,
+        RatelimitException,
+        TimeoutException,
+    )
 except ImportError:
-    st.error("The 'ddgs' package is required. Install it with: pip install -U ddgs")
+    st.error(
+        "Missing dependency: ddgs\n\n"
+        "Install it with: pip install -U ddgs"
+    )
     st.stop()
 
 
-APP_TITLE = "Instagram Public Comments Discovery"
-APP_VERSION = "1.1.0"
+APP_TITLE = "Instagram Google Public Discovery"
+APP_VERSION = "2.0.0"
 
-DEFAULT_BACKEND = "auto"
+GOOGLE_BACKEND = "google"
+
+DEFAULT_RESULTS_PER_QUERY = 10
+DEFAULT_MAX_QUERIES = 70
+
+DEFAULT_DELAY_MIN = 0.20
+DEFAULT_DELAY_MAX = 0.45
+
+DEFAULT_TIMEOUT = 10
+DEFAULT_RETRIES = 2
+
 DEFAULT_REGION = "us-en"
-DEFAULT_SAFESEARCH = "moderate"
-
-DEFAULT_RESULTS_PER_QUERY = 8
-DEFAULT_MAX_QUERIES = 80
-
-DEFAULT_DELAY_MIN = 0.25
-DEFAULT_DELAY_MAX = 0.60
-
-DEFAULT_TIMEOUT = 8
-DEFAULT_RETRIES = 1
+DEFAULT_SAFESEARCH = "off"
 
 
-SUPPORTED_BACKENDS = [
-    "auto",
-    "bing",
-    "brave",
-    "duckduckgo",
-    "google",
-    "mojeek",
-    "yahoo",
-    "yandex",
-]
-
-
-SCORE_WEIGHTS = {
-    "username_title": 10,
-    "at_username_title": 14,
-    "username_snippet": 8,
-    "at_username_snippet": 14,
-    "username_url": 5,
+SCORE = {
+    "exact_username_title": 15,
+    "exact_mention_title": 20,
+    "exact_username_snippet": 14,
+    "exact_mention_snippet": 20,
+    "exact_username_url": 7,
     "instagram_domain": 5,
-    "instagram_post": 8,
-    "instagram_reel": 10,
-    "instagram_profile": 7,
-    "comment": 6,
-    "comments": 6,
-    "commented": 5,
-    "mention": 5,
-    "mentions": 5,
-    "mentioned": 5,
-    "tag": 3,
-    "tags": 3,
-    "tagged": 4,
-    "query_relevance": 3,
-    "multiple_discoveries": 2,
+    "post": 10,
+    "reel": 13,
+    "comment_keyword": 8,
+    "mention_keyword": 7,
+    "tag_keyword": 4,
+    "query_match": 4,
+    "repeat_discovery": 3,
+    "distinct_snippet": 2,
 }
 
 
-TRACKING_PARAMETERS = {
+TRACKING_PARAMS = {
     "utm_source",
     "utm_medium",
     "utm_campaign",
@@ -102,21 +92,32 @@ class SearchQuery:
 class SearchResult:
     score: int
     result_type: str
+
     title: str
     url: str
     snippet: str
     domain: str
+
     backend: str
+
     query: str
     query_category: str
     query_intent: str
+
     discovered_at: str
+
     username_match: bool
     mention_match: bool
     comment_match: bool
     tag_match: bool
     reel_match: bool
     post_match: bool
+
+    discovery_count: int = 1
+    distinct_snippets: int = 1
+
+    queries_seen: list[str] = field(default_factory=list)
+    snippets_seen: list[str] = field(default_factory=list)
 
 
 def initialize_session_state() -> None:
@@ -141,18 +142,15 @@ def initialize_session_state() -> None:
 def reset_search_state() -> None:
     st.session_state.results = []
     st.session_state.errors = []
-    st.session_state.searched_username = ""
+
     st.session_state.search_completed = False
     st.session_state.search_running = False
     st.session_state.stop_requested = False
+
     st.session_state.successful_queries = 0
     st.session_state.failed_queries = 0
     st.session_state.total_queries = 0
     st.session_state.completed_queries = 0
-
-
-def request_stop() -> None:
-    st.session_state.stop_requested = True
 
 
 def normalize_username(value: str) -> str:
@@ -184,10 +182,13 @@ def validate_username(username: str) -> tuple[bool, str]:
     if len(username) > 30:
         return False, "Instagram username is too long."
 
-    if not re.fullmatch(r"[A-Za-z0-9._]+", username):
+    if not re.fullmatch(
+        r"[A-Za-z0-9._]+",
+        username,
+    ):
         return (
             False,
-            "Username can contain only letters, numbers, dots and underscores.",
+            "Only letters, numbers, dots and underscores are allowed.",
         )
 
     return True, ""
@@ -200,7 +201,11 @@ def add_query(
     category: str,
     intent: str,
 ) -> None:
-    text = re.sub(r"\s+", " ", text.strip())
+    text = re.sub(
+        r"\s+",
+        " ",
+        text.strip(),
+    )
 
     if not text:
         return
@@ -221,271 +226,276 @@ def add_query(
     )
 
 
-def generate_comment_queries(username: str) -> list[SearchQuery]:
-    queries: list[SearchQuery] = []
-    seen: set[str] = set()
-
-    comment_words = [
-        "comment",
-        "comments",
-        "commented",
-        "commenting",
-    ]
-
-    mention_words = [
-        "mention",
-        "mentions",
-        "mentioned",
-    ]
-
-    tag_words = [
-        "tag",
-        "tags",
-        "tagged",
-    ]
-
-    # Direct comment discovery.
-    for word in comment_words:
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "{username}" {word}',
-            "Comments",
-            f"Username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "@{username}" {word}',
-            "Comments",
-            f"@username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "{username}" Instagram {word}',
-            "Comments",
-            f"Username + Instagram + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "@{username}" Instagram {word}',
-            "Comments",
-            f"@username + Instagram + {word}",
-        )
-
-    # Instagram posts + comments.
-    for word in comment_words:
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/p/ "{username}" {word}',
-            "Post Comments",
-            f"Post + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/p/ "@{username}" {word}',
-            "Post Comments",
-            f"Post + @{username} + {word}",
-        )
-
-    # Instagram reels + comments.
-    for word in comment_words:
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/reel/ "{username}" {word}',
-            "Reel Comments",
-            f"Reel + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/reel/ "@{username}" {word}',
-            "Reel Comments",
-            f"Reel + @{username} + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/reels/ "{username}" {word}',
-            "Reel Comments",
-            f"Reels + {word}",
-        )
-
-    # Mentions.
-    for word in mention_words:
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "{username}" {word}',
-            "Mentions",
-            f"Username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "@{username}" {word}',
-            "Mentions",
-            f"@username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/p/ "@{username}" {word}',
-            "Post Mentions",
-            f"Post + @{username} + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/reel/ "@{username}" {word}',
-            "Reel Mentions",
-            f"Reel + @{username} + {word}",
-        )
-
-    # Tags.
-    for word in tag_words:
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "{username}" {word}',
-            "Tags",
-            f"Username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com "@{username}" {word}',
-            "Tags",
-            f"@username + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/p/ "@{username}" {word}',
-            "Post Tags",
-            f"Post + {word}",
-        )
-
-        add_query(
-            queries,
-            seen,
-            f'site:instagram.com/reel/ "@{username}" {word}',
-            "Reel Tags",
-            f"Reel + {word}",
-        )
-
-    # Post discovery.
-    post_queries = [
-        f'site:instagram.com/p/ "{username}"',
-        f'site:instagram.com/p/ "@{username}"',
-        f'site:instagram.com/p/ "{username}" Instagram',
-        f'site:instagram.com/p/ "@{username}" Instagram',
-        f'site:instagram.com/p/ "{username}" caption',
-        f'site:instagram.com/p/ "@{username}" caption',
-        f'site:instagram.com/p/ "{username}" text',
-        f'site:instagram.com/p/ "@{username}" text',
-    ]
-
-    for query in post_queries:
-        add_query(
-            queries,
-            seen,
-            query,
-            "Instagram Posts",
-            "Public indexed post discovery",
-        )
-
-    # Reel discovery.
-    reel_queries = [
-        f'site:instagram.com/reel/ "{username}"',
-        f'site:instagram.com/reel/ "@{username}"',
-        f'site:instagram.com/reel/ "{username}" Instagram',
-        f'site:instagram.com/reel/ "@{username}" Instagram',
-        f'site:instagram.com/reel/ "{username}" caption',
-        f'site:instagram.com/reel/ "@{username}" caption',
-        f'site:instagram.com/reel/ "{username}" comment',
-        f'site:instagram.com/reel/ "@{username}" comment',
-        f'site:instagram.com/reels/ "{username}"',
-        f'site:instagram.com/reels/ "@{username}"',
-    ]
-
-    for query in reel_queries:
-        add_query(
-            queries,
-            seen,
-            query,
-            "Instagram Reels",
-            "Public indexed reel discovery",
-        )
-
-    # Exact username discovery.
-    exact_queries = [
-        f'site:instagram.com "{username}"',
-        f'site:instagram.com "@{username}"',
-        f'site:instagram.com "{username}" Instagram',
-        f'site:instagram.com "@{username}" Instagram',
-        f'site:instagram.com "{username}" profile',
-        f'site:instagram.com "@{username}" profile',
-    ]
-
-    for query in exact_queries:
-        add_query(
-            queries,
-            seen,
-            query,
-            "Indexed Instagram",
-            "Exact username discovery",
-        )
-
-    # High-value combinations.
-    combined_queries = [
-        f'site:instagram.com "{username}" comment mention',
-        f'site:instagram.com "@{username}" comment mention',
-        f'site:instagram.com "{username}" comments mentions',
-        f'site:instagram.com "@{username}" comments mentions',
-        f'site:instagram.com "{username}" comment tagged',
-        f'site:instagram.com "@{username}" comment tagged',
-        f'site:instagram.com "{username}" mentioned tagged',
-        f'site:instagram.com "@{username}" mentioned tagged',
-        f'site:instagram.com/p/ "{username}" comment mention',
-        f'site:instagram.com/p/ "@{username}" comment mention',
-        f'site:instagram.com/reel/ "{username}" comment mention',
-        f'site:instagram.com/reel/ "@{username}" comment mention',
-    ]
-
-    for query in combined_queries:
-        add_query(
-            queries,
-            seen,
-            query,
-            "High Relevance",
-            "Combined comment / mention / tag",
-        )
-
-    return queries
-
-
-def generate_all_queries(
+def generate_queries(
     username: str,
     max_queries: int,
 ) -> list[SearchQuery]:
-    queries = generate_comment_queries(username)
+
+    queries: list[SearchQuery] = []
+    seen: set[str] = set()
+
+    u = username
+    au = f"@{username}"
+
+    # ---------------------------------------------------------
+    # 1. Exact Instagram username
+    # ---------------------------------------------------------
+
+    exact_queries = [
+        (
+            f'site:instagram.com "{u}"',
+            "Exact Username",
+            "Exact username",
+        ),
+        (
+            f'site:instagram.com "{au}"',
+            "Exact Mention",
+            "Exact @username",
+        ),
+        (
+            f'site:instagram.com "{u}" Instagram',
+            "Exact Username",
+            "Username + Instagram",
+        ),
+        (
+            f'site:instagram.com "{au}" Instagram',
+            "Exact Mention",
+            "@username + Instagram",
+        ),
+    ]
+
+    for text, category, intent in exact_queries:
+        add_query(
+            queries,
+            seen,
+            text,
+            category,
+            intent,
+        )
+
+    # ---------------------------------------------------------
+    # 2. Posts
+    # ---------------------------------------------------------
+
+    post_terms = [
+        "comment",
+        "comments",
+        "commented",
+        "mention",
+        "mentioned",
+        "tag",
+        "tagged",
+        "caption",
+    ]
+
+    for term in post_terms:
+
+        add_query(
+            queries,
+            seen,
+            f'site:instagram.com/p/ "{u}" "{term}"',
+            "Instagram Posts",
+            f'Post + exact username + "{term}"',
+        )
+
+        add_query(
+            queries,
+            seen,
+            f'site:instagram.com/p/ "{au}" "{term}"',
+            "Instagram Posts",
+            f'Post + exact @username + "{term}"',
+        )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/p/ "{u}"',
+        "Instagram Posts",
+        "Exact username inside indexed post",
+    )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/p/ "{au}"',
+        "Instagram Posts",
+        "Exact @username inside indexed post",
+    )
+
+    # ---------------------------------------------------------
+    # 3. Reels
+    # ---------------------------------------------------------
+
+    for term in post_terms:
+
+        add_query(
+            queries,
+            seen,
+            f'site:instagram.com/reel/ "{u}" "{term}"',
+            "Instagram Reels",
+            f'Reel + exact username + "{term}"',
+        )
+
+        add_query(
+            queries,
+            seen,
+            f'site:instagram.com/reel/ "{au}" "{term}"',
+            "Instagram Reels",
+            f'Reel + exact @username + "{term}"',
+        )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/reel/ "{u}"',
+        "Instagram Reels",
+        "Exact username inside indexed Reel",
+    )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/reel/ "{au}"',
+        "Instagram Reels",
+        "Exact @username inside indexed Reel",
+    )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/reels/ "{u}"',
+        "Instagram Reels",
+        "Alternative Reels URL pattern",
+    )
+
+    add_query(
+        queries,
+        seen,
+        f'site:instagram.com/reels/ "{au}"',
+        "Instagram Reels",
+        "Alternative Reels URL pattern",
+    )
+
+    # ---------------------------------------------------------
+    # 4. Comments
+    # ---------------------------------------------------------
+
+    comment_queries = [
+        f'site:instagram.com "{u}" comment',
+        f'site:instagram.com "{au}" comment',
+        f'site:instagram.com "{u}" comments',
+        f'site:instagram.com "{au}" comments',
+        f'site:instagram.com "{u}" commented',
+        f'site:instagram.com "{au}" commented',
+        f'site:instagram.com "{u}" commenting',
+        f'site:instagram.com "{au}" commenting',
+        f'site:instagram.com/p/ "{u}" comment',
+        f'site:instagram.com/p/ "{au}" comment',
+        f'site:instagram.com/p/ "{u}" comments',
+        f'site:instagram.com/p/ "{au}" comments',
+        f'site:instagram.com/reel/ "{u}" comment',
+        f'site:instagram.com/reel/ "{au}" comment',
+        f'site:instagram.com/reel/ "{u}" comments',
+        f'site:instagram.com/reel/ "{au}" comments',
+    ]
+
+    for text in comment_queries:
+        add_query(
+            queries,
+            seen,
+            text,
+            "Comments",
+            "Exact username comment discovery",
+        )
+
+    # ---------------------------------------------------------
+    # 5. Mentions
+    # ---------------------------------------------------------
+
+    mention_queries = [
+        f'site:instagram.com "{au}" mention',
+        f'site:instagram.com "{au}" mentions',
+        f'site:instagram.com "{au}" mentioned',
+        f'site:instagram.com/p/ "{au}" mention',
+        f'site:instagram.com/p/ "{au}" mentions',
+        f'site:instagram.com/p/ "{au}" mentioned',
+        f'site:instagram.com/reel/ "{au}" mention',
+        f'site:instagram.com/reel/ "{au}" mentions',
+        f'site:instagram.com/reel/ "{au}" mentioned',
+    ]
+
+    for text in mention_queries:
+        add_query(
+            queries,
+            seen,
+            text,
+            "Mentions",
+            "Exact @username mention discovery",
+        )
+
+    # ---------------------------------------------------------
+    # 6. Tags
+    # ---------------------------------------------------------
+
+    tag_queries = [
+        f'site:instagram.com "{au}" tag',
+        f'site:instagram.com "{au}" tagged',
+        f'site:instagram.com "{au}" tags',
+        f'site:instagram.com/p/ "{au}" tagged',
+        f'site:instagram.com/p/ "{au}" tag',
+        f'site:instagram.com/reel/ "{au}" tagged',
+        f'site:instagram.com/reel/ "{au}" tag',
+    ]
+
+    for text in tag_queries:
+        add_query(
+            queries,
+            seen,
+            text,
+            "Tags",
+            "Exact @username tag discovery",
+        )
+
+    # ---------------------------------------------------------
+    # 7. Highly specific combinations
+    # ---------------------------------------------------------
+
+    combinations = [
+        (
+            f'site:instagram.com/p/ "{au}" "comment" "mention"',
+            "Post Intelligence",
+        ),
+        (
+            f'site:instagram.com/p/ "{au}" "comment" "tagged"',
+            "Post Intelligence",
+        ),
+        (
+            f'site:instagram.com/reel/ "{au}" "comment" "mention"',
+            "Reel Intelligence",
+        ),
+        (
+            f'site:instagram.com/reel/ "{au}" "comment" "tagged"',
+            "Reel Intelligence",
+        ),
+        (
+            f'site:instagram.com "{au}" "comment" "mentioned"',
+            "Comment Intelligence",
+        ),
+        (
+            f'site:instagram.com "{au}" "comment" "tagged"',
+            "Comment Intelligence",
+        ),
+    ]
+
+    for text, category in combinations:
+        add_query(
+            queries,
+            seen,
+            text,
+            category,
+            "Exact username + multiple indicators",
+        )
+
     return queries[:max_queries]
 
 
@@ -494,9 +504,12 @@ def normalize_url(url: str) -> str:
         return ""
 
     try:
-        parsed = urlsplit(url.strip())
+        parsed = urlsplit(
+            url.strip()
+        )
 
         scheme = parsed.scheme.lower()
+
         netloc = parsed.netloc.lower()
 
         if netloc.startswith("www."):
@@ -511,21 +524,23 @@ def normalize_url(url: str) -> str:
         if path != "/" and path.endswith("/"):
             path = path[:-1]
 
-        parameters = []
+        params = []
 
         for key, value in parse_qsl(
             parsed.query,
             keep_blank_values=True,
         ):
-            if key.lower() in TRACKING_PARAMETERS:
+            if key.lower() in TRACKING_PARAMS:
                 continue
 
-            parameters.append((key, value))
+            params.append(
+                (key, value)
+            )
 
-        parameters.sort()
+        params.sort()
 
         query = urlencode(
-            parameters,
+            params,
             doseq=True,
         )
 
@@ -540,49 +555,82 @@ def normalize_url(url: str) -> str:
         )
 
     except Exception:
-        return url.split("#", 1)[0]
+        return url.split(
+            "#",
+            1,
+        )[0]
 
 
 def url_key(url: str) -> str:
-    return normalize_url(url).casefold()
+    return normalize_url(
+        url
+    ).casefold()
 
 
 def get_domain(url: str) -> str:
     try:
-        domain = urlsplit(url).netloc.lower()
+        domain = urlsplit(
+            url
+        ).netloc.lower()
 
         if domain.startswith("www."):
             domain = domain[4:]
 
         return domain
+
     except Exception:
         return ""
 
 
-def username_pattern(username: str) -> re.Pattern:
+def is_instagram_url(url: str) -> bool:
+    domain = get_domain(
+        url
+    )
+
+    return (
+        domain == "instagram.com"
+        or domain.endswith(".instagram.com")
+    )
+
+
+def username_regex(
+    username: str,
+) -> re.Pattern:
+
     return re.compile(
-        rf"(?<![A-Za-z0-9._])@?{re.escape(username)}(?![A-Za-z0-9._])",
+        rf"(?<![A-Za-z0-9._])"
+        rf"@?{re.escape(username)}"
+        rf"(?![A-Za-z0-9._])",
         re.IGNORECASE,
     )
 
 
-def mention_pattern(username: str) -> re.Pattern:
+def mention_regex(
+    username: str,
+) -> re.Pattern:
+
     return re.compile(
-        rf"(?<![A-Za-z0-9._])@{re.escape(username)}(?![A-Za-z0-9._])",
+        rf"(?<![A-Za-z0-9._])"
+        rf"@{re.escape(username)}"
+        rf"(?![A-Za-z0-9._])",
         re.IGNORECASE,
     )
 
 
-def keyword_exists(
+def contains_word(
     text: str,
     words: list[str],
 ) -> bool:
+
     if not text:
         return False
 
     for word in words:
+
         if re.search(
-            rf"\b{re.escape(word)}\b",
+            rf"(?<![A-Za-z])"
+            rf"{re.escape(word)}"
+            rf"(?![A-Za-z])",
             text,
             re.IGNORECASE,
         ):
@@ -593,38 +641,42 @@ def keyword_exists(
 
 def classify_result(
     url: str,
-    title: str,
-    snippet: str,
 ) -> str:
-    url_lower = url.lower()
+
+    path = urlsplit(
+        url.lower()
+    ).path
 
     if re.search(
-        r"instagram\.com/(?:reel|reels)/",
-        url_lower,
+        r"/reel/",
+        path,
     ):
         return "Instagram Reel"
 
     if re.search(
-        r"instagram\.com/p/",
-        url_lower,
+        r"/reels/",
+        path,
+    ):
+        return "Instagram Reel"
+
+    if re.search(
+        r"/p/",
+        path,
     ):
         return "Instagram Post"
 
     if re.search(
-        r"instagram\.com/(?:tv|videos?)/",
-        url_lower,
+        r"/tv/",
+        path,
     ):
         return "Instagram Video"
 
-    if "instagram.com" in url_lower:
-        path = urlsplit(url_lower).path.strip("/")
+    clean_path = path.strip("/")
 
-        if path and "/" not in path:
-            return "Instagram Profile"
+    if clean_path and "/" not in clean_path:
+        return "Instagram Profile"
 
-        return "Instagram Other"
-
-    return "Other"
+    return "Instagram Page"
 
 
 def calculate_score(
@@ -634,36 +686,46 @@ def calculate_score(
     url: str,
     query: SearchQuery,
 ) -> tuple[int, dict[str, bool]]:
+
     title = title or ""
     snippet = snippet or ""
     url = url or ""
 
-    user_re = username_pattern(username)
-    mention_re = mention_pattern(username)
-
-    username_in_title = bool(
-        user_re.search(title)
+    u_re = username_regex(
+        username
     )
 
-    mention_in_title = bool(
-        mention_re.search(title)
+    m_re = mention_regex(
+        username
     )
 
-    username_in_snippet = bool(
-        user_re.search(snippet)
+    exact_username_title = bool(
+        u_re.search(title)
     )
 
-    mention_in_snippet = bool(
-        mention_re.search(snippet)
+    exact_mention_title = bool(
+        m_re.search(title)
     )
 
-    username_in_url = bool(
-        user_re.search(url)
+    exact_username_snippet = bool(
+        u_re.search(snippet)
     )
 
-    combined = f"{title} {snippet} {url}"
+    exact_mention_snippet = bool(
+        m_re.search(snippet)
+    )
 
-    comment_match = keyword_exists(
+    exact_username_url = bool(
+        u_re.search(url)
+    )
+
+    combined = (
+        f"{title} "
+        f"{snippet} "
+        f"{url}"
+    )
+
+    comment_match = contains_word(
         combined,
         [
             "comment",
@@ -673,7 +735,7 @@ def calculate_score(
         ],
     )
 
-    mention_match = keyword_exists(
+    mention_match = contains_word(
         combined,
         [
             "mention",
@@ -682,7 +744,7 @@ def calculate_score(
         ],
     )
 
-    tag_match = keyword_exists(
+    tag_match = contains_word(
         combined,
         [
             "tag",
@@ -697,10 +759,6 @@ def calculate_score(
             url,
             re.IGNORECASE,
         )
-        or keyword_exists(
-            combined,
-            ["reel", "reels"],
-        )
     )
 
     post_match = bool(
@@ -713,81 +771,83 @@ def calculate_score(
 
     score = 0
 
-    if username_in_title:
-        score += SCORE_WEIGHTS["username_title"]
+    if exact_username_title:
+        score += SCORE[
+            "exact_username_title"
+        ]
 
-    if mention_in_title:
-        score += SCORE_WEIGHTS["at_username_title"]
+    if exact_mention_title:
+        score += SCORE[
+            "exact_mention_title"
+        ]
 
-    if username_in_snippet:
-        score += SCORE_WEIGHTS["username_snippet"]
+    if exact_username_snippet:
+        score += SCORE[
+            "exact_username_snippet"
+        ]
 
-    if mention_in_snippet:
-        score += SCORE_WEIGHTS["at_username_snippet"]
+    if exact_mention_snippet:
+        score += SCORE[
+            "exact_mention_snippet"
+        ]
 
-    if username_in_url:
-        score += SCORE_WEIGHTS["username_url"]
+    if exact_username_url:
+        score += SCORE[
+            "exact_username_url"
+        ]
 
-    if "instagram.com" in url.lower():
-        score += SCORE_WEIGHTS["instagram_domain"]
+    score += SCORE[
+        "instagram_domain"
+    ]
 
     if post_match:
-        score += SCORE_WEIGHTS["instagram_post"]
+        score += SCORE["post"]
 
     if reel_match:
-        score += SCORE_WEIGHTS["instagram_reel"]
+        score += SCORE["reel"]
 
-    if keyword_exists(combined, ["comment"]):
-        score += SCORE_WEIGHTS["comment"]
+    if comment_match:
+        score += SCORE[
+            "comment_keyword"
+        ]
 
-    if keyword_exists(combined, ["comments"]):
-        score += SCORE_WEIGHTS["comments"]
+    if mention_match:
+        score += SCORE[
+            "mention_keyword"
+        ]
 
-    if keyword_exists(combined, ["commented"]):
-        score += SCORE_WEIGHTS["commented"]
+    if tag_match:
+        score += SCORE[
+            "tag_keyword"
+        ]
 
-    if keyword_exists(combined, ["mention"]):
-        score += SCORE_WEIGHTS["mention"]
+    if (
+        query.category
+        in {
+            "Comments",
+            "Mentions",
+            "Tags",
+            "Post Intelligence",
+            "Reel Intelligence",
+            "Comment Intelligence",
+        }
+    ):
+        score += SCORE[
+            "query_match"
+        ]
 
-    if keyword_exists(combined, ["mentions"]):
-        score += SCORE_WEIGHTS["mentions"]
-
-    if keyword_exists(combined, ["mentioned"]):
-        score += SCORE_WEIGHTS["mentioned"]
-
-    if keyword_exists(combined, ["tag"]):
-        score += SCORE_WEIGHTS["tag"]
-
-    if keyword_exists(combined, ["tags"]):
-        score += SCORE_WEIGHTS["tags"]
-
-    if keyword_exists(combined, ["tagged"]):
-        score += SCORE_WEIGHTS["tagged"]
-
-    if query.category.lower() in {
-        "comments",
-        "post comments",
-        "reel comments",
-        "mentions",
-        "post mentions",
-        "reel mentions",
-        "tags",
-        "post tags",
-        "reel tags",
-        "high relevance",
-    }:
-        score += SCORE_WEIGHTS["query_relevance"]
-
-    matches = {
+    return score, {
         "username_match": (
-            username_in_title
-            or username_in_snippet
-            or username_in_url
+            exact_username_title
+            or exact_username_snippet
+            or exact_username_url
         ),
         "mention_match": (
-            mention_in_title
-            or mention_in_snippet
-            or bool(mention_re.search(url))
+            exact_mention_title
+            or exact_mention_snippet
+            or bool(
+                m_re.search(url)
+            )
         ),
         "comment_match": comment_match,
         "tag_match": tag_match,
@@ -795,59 +855,49 @@ def calculate_score(
         "post_match": post_match,
     }
 
-    return score, matches
 
+class GoogleSearchProvider:
 
-class SearchProvider:
-    name = "Base"
+    def __init__(
+        self,
+        timeout: int,
+    ):
+        self.client = DDGS(
+            timeout=timeout
+        )
 
     def search(
         self,
         query: str,
-        backend: str,
         region: str,
         safesearch: str,
         max_results: int,
-        timeout: int,
-    ) -> list[dict]:
-        raise NotImplementedError
-
-
-class DDGSSearchProvider(SearchProvider):
-    name = "DDGS"
-
-    def __init__(self, timeout: int):
-        self.timeout = timeout
-        self.client = DDGS(timeout=timeout)
-
-    def search(
-        self,
-        query: str,
-        backend: str,
-        region: str,
-        safesearch: str,
-        max_results: int,
-        timeout: int,
     ) -> list[dict]:
 
         results = self.client.text(
-            query,
-            backend=backend,
+            query=query,
+            backend=GOOGLE_BACKEND,
             region=region,
             safesearch=safesearch,
             max_results=max_results,
+            page=1,
         )
 
-        return list(results or [])
+        return list(
+            results or []
+        )
 
 
-def convert_raw_result(
+def extract_result(
     raw: dict,
     search_query: SearchQuery,
     username: str,
-    backend: str,
 ) -> SearchResult | None:
-    if not isinstance(raw, dict):
+
+    if not isinstance(
+        raw,
+        dict,
+    ):
         return None
 
     title = str(
@@ -872,22 +922,14 @@ def convert_raw_result(
     if not url:
         return None
 
-    clean_url = normalize_url(url)
-
-    if not clean_url:
-        return None
-
-    domain = get_domain(clean_url)
-
-    # Instagram-only enforcement.
-    if "instagram.com" not in domain:
-        return None
-
-    result_type = classify_result(
-        clean_url,
-        title,
-        snippet,
+    clean_url = normalize_url(
+        url
     )
+
+    if not is_instagram_url(
+        clean_url
+    ):
+        return None
 
     score, matches = calculate_score(
         username=username,
@@ -899,36 +941,195 @@ def convert_raw_result(
 
     return SearchResult(
         score=score,
-        result_type=result_type,
+        result_type=classify_result(
+            clean_url
+        ),
         title=title,
         url=clean_url,
         snippet=snippet,
-        domain=domain,
-        backend=backend,
+        domain=get_domain(
+            clean_url
+        ),
+        backend=GOOGLE_BACKEND,
         query=search_query.text,
         query_category=search_query.category,
         query_intent=search_query.intent,
         discovered_at=datetime.now(
             timezone.utc
         ).isoformat(),
-        username_match=matches["username_match"],
-        mention_match=matches["mention_match"],
-        comment_match=matches["comment_match"],
-        tag_match=matches["tag_match"],
-        reel_match=matches["reel_match"],
-        post_match=matches["post_match"],
+        username_match=matches[
+            "username_match"
+        ],
+        mention_match=matches[
+            "mention_match"
+        ],
+        comment_match=matches[
+            "comment_match"
+        ],
+        tag_match=matches[
+            "tag_match"
+        ],
+        reel_match=matches[
+            "reel_match"
+        ],
+        post_match=matches[
+            "post_match"
+        ],
+        discovery_count=1,
+        distinct_snippets=1,
+        queries_seen=[
+            search_query.text
+        ],
+        snippets_seen=[
+            snippet
+        ]
+        if snippet
+        else [],
     )
+
+
+def merge_result(
+    store: dict[str, SearchResult],
+    result: SearchResult,
+) -> None:
+
+    key = url_key(
+        result.url
+    )
+
+    if not key:
+        return
+
+    if key not in store:
+
+        store[key] = result
+        return
+
+    existing = store[key]
+
+    existing.discovery_count += 1
+
+    if result.query not in existing.queries_seen:
+
+        existing.queries_seen.append(
+            result.query
+        )
+
+    if (
+        result.snippet
+        and result.snippet
+        not in existing.snippets_seen
+    ):
+
+        existing.snippets_seen.append(
+            result.snippet
+        )
+
+        existing.distinct_snippets = len(
+            existing.snippets_seen
+        )
+
+    existing.username_match = (
+        existing.username_match
+        or result.username_match
+    )
+
+    existing.mention_match = (
+        existing.mention_match
+        or result.mention_match
+    )
+
+    existing.comment_match = (
+        existing.comment_match
+        or result.comment_match
+    )
+
+    existing.tag_match = (
+        existing.tag_match
+        or result.tag_match
+    )
+
+    existing.reel_match = (
+        existing.reel_match
+        or result.reel_match
+    )
+
+    existing.post_match = (
+        existing.post_match
+        or result.post_match
+    )
+
+    if (
+        result.score
+        > existing.score
+    ):
+
+        best_snippet = result.snippet
+
+        existing.score = result.score
+        existing.title = result.title or existing.title
+        existing.query = result.query
+        existing.query_category = (
+            result.query_category
+        )
+        existing.query_intent = (
+            result.query_intent
+        )
+
+        if best_snippet:
+            existing.snippet = best_snippet
+
+    existing.score += SCORE[
+        "repeat_discovery"
+    ]
+
+    if existing.distinct_snippets > 1:
+        existing.score += SCORE[
+            "distinct_snippet"
+        ]
+
+
+def sort_results(
+    store: dict[str, SearchResult],
+) -> list[SearchResult]:
+
+    results = list(
+        store.values()
+    )
+
+    results.sort(
+        key=lambda result: (
+            -result.score,
+            -result.discovery_count,
+            -result.distinct_snippets,
+            not result.comment_match,
+            not result.mention_match,
+            not result.reel_match,
+            not result.post_match,
+            result.domain,
+        )
+    )
+
+    return results
 
 
 def randomized_delay(
     minimum: float,
     maximum: float,
 ) -> None:
-    minimum = max(0.0, minimum)
-    maximum = max(minimum, maximum)
 
     if maximum <= 0:
         return
+
+    minimum = max(
+        0.0,
+        minimum,
+    )
+
+    maximum = max(
+        minimum,
+        maximum,
+    )
 
     time.sleep(
         random.uniform(
@@ -938,202 +1139,131 @@ def randomized_delay(
     )
 
 
-def execute_query(
-    provider: SearchProvider,
-    query: SearchQuery,
+def execute_google_query(
+    provider: GoogleSearchProvider,
+    search_query: SearchQuery,
     username: str,
     settings: dict,
 ) -> tuple[list[SearchResult], str | None]:
 
-    retries = settings["retries"]
     last_error = None
 
-    for attempt in range(retries + 1):
+    for attempt in range(
+        settings["retries"] + 1
+    ):
 
         if st.session_state.stop_requested:
-            return [], "Search stopped by user."
 
-        try:
-            if attempt > 0:
-                backoff = min(
-                    8.0,
-                    (2 ** attempt)
-                    + random.uniform(0.2, 0.8),
-                )
-
-                time.sleep(backoff)
-
-            raw_results = provider.search(
-                query=query.text,
-                backend=settings["backend"],
-                region=settings["region"],
-                safesearch=settings["safesearch"],
-                max_results=settings["results_per_query"],
-                timeout=settings["timeout"],
+            return (
+                [],
+                "Search stopped by user.",
             )
 
-            converted = []
+        try:
+
+            if attempt > 0:
+
+                backoff = min(
+                    10.0,
+                    (2 ** attempt)
+                    + random.uniform(
+                        0.2,
+                        0.8,
+                    ),
+                )
+
+                time.sleep(
+                    backoff
+                )
+
+            raw_results = provider.search(
+                query=search_query.text,
+                region=settings["region"],
+                safesearch=settings[
+                    "safesearch"
+                ],
+                max_results=settings[
+                    "results_per_query"
+                ],
+            )
+
+            results = []
 
             for raw in raw_results:
-                result = convert_raw_result(
+
+                result = extract_result(
                     raw=raw,
-                    search_query=query,
+                    search_query=search_query,
                     username=username,
-                    backend=settings["backend"],
                 )
 
                 if result:
-                    converted.append(result)
+                    results.append(
+                        result
+                    )
 
-            return converted, None
+            return (
+                results,
+                None,
+            )
 
         except RatelimitException as exc:
-            last_error = f"Rate limit: {exc}"
+
+            last_error = (
+                f"Google rate limit / provider "
+                f"rate limit: {exc}"
+            )
 
         except TimeoutException as exc:
-            last_error = f"Timeout: {exc}"
+
+            last_error = (
+                f"Google timeout: {exc}"
+            )
 
         except DDGSException as exc:
-            last_error = f"DDGS error: {exc}"
+
+            last_error = (
+                f"DDGS Google backend error: {exc}"
+            )
 
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
 
-        if attempt < retries:
+            last_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if attempt < settings[
+            "retries"
+        ]:
+
             randomized_delay(
                 settings["delay_min"],
                 settings["delay_max"],
             )
 
-    return [], last_error or "Unknown search error."
-
-
-def deduplicate_results(
-    results: list[SearchResult],
-    username: str,
-) -> list[SearchResult]:
-
-    grouped: dict[str, list[SearchResult]] = {}
-
-    for result in results:
-        key = url_key(result.url)
-
-        if not key:
-            continue
-
-        grouped.setdefault(key, []).append(result)
-
-    final_results = []
-
-    for items in grouped.values():
-
-        primary = max(
-            items,
-            key=lambda item: (
-                item.score,
-                item.mention_match,
-                item.comment_match,
-                item.reel_match,
-                item.post_match,
-                len(item.snippet),
-            ),
-        )
-
-        duplicate_count = len(items)
-
-        if duplicate_count > 1:
-            primary.score += min(
-                (duplicate_count - 1)
-                * SCORE_WEIGHTS["multiple_discoveries"],
-                10,
-            )
-
-        primary.username_match = any(
-            item.username_match for item in items
-        )
-
-        primary.mention_match = any(
-            item.mention_match for item in items
-        )
-
-        primary.comment_match = any(
-            item.comment_match for item in items
-        )
-
-        primary.tag_match = any(
-            item.tag_match for item in items
-        )
-
-        primary.reel_match = any(
-            item.reel_match for item in items
-        )
-
-        primary.post_match = any(
-            item.post_match for item in items
-        )
-
-        best_query = max(
-            items,
-            key=lambda item: (
-                item.score,
-                item.mention_match,
-                item.comment_match,
-            ),
-        )
-
-        primary.query = best_query.query
-        primary.query_category = best_query.query_category
-        primary.query_intent = best_query.query_intent
-
-        final_results.append(primary)
-
-    final_results.sort(
-        key=lambda item: (
-            -item.score,
-            not item.comment_match,
-            not item.mention_match,
-            not item.reel_match,
-            not item.post_match,
-            item.domain,
-        )
+    return (
+        [],
+        last_error
+        or "Unknown Google search error.",
     )
-
-    return final_results
 
 
 def results_dataframe(
     results: list[SearchResult],
 ) -> pd.DataFrame:
 
-    columns = [
-        "Score",
-        "Type",
-        "Title",
-        "URL",
-        "Snippet",
-        "Domain",
-        "Backend",
-        "Query",
-        "Query Category",
-        "Query Intent",
-        "Discovered At",
-        "Username Match",
-        "Mention Match",
-        "Comment Match",
-        "Tag Match",
-        "Reel Match",
-        "Post Match",
-    ]
-
     rows = []
 
     for result in results:
+
         rows.append(
             {
                 "Score": result.score,
+                "Discovery Count": result.discovery_count,
+                "Distinct Snippets": result.distinct_snippets,
                 "Type": result.result_type,
                 "Title": result.title,
-                "URL": result.url,
+                "Post / Reel URL": result.url,
                 "Snippet": result.snippet,
                 "Domain": result.domain,
                 "Backend": result.backend,
@@ -1142,15 +1272,46 @@ def results_dataframe(
                 "Query Intent": result.query_intent,
                 "Discovered At": result.discovered_at,
                 "Username Match": result.username_match,
-                "Mention Match": result.mention_match,
+                "@Mention Match": result.mention_match,
                 "Comment Match": result.comment_match,
                 "Tag Match": result.tag_match,
                 "Reel Match": result.reel_match,
                 "Post Match": result.post_match,
+                "Different Queries": len(
+                    result.queries_seen
+                ),
+                "Different Snippets": len(
+                    result.snippets_seen
+                ),
             }
         )
 
-    return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Score",
+            "Discovery Count",
+            "Distinct Snippets",
+            "Type",
+            "Title",
+            "Post / Reel URL",
+            "Snippet",
+            "Domain",
+            "Backend",
+            "Query",
+            "Query Category",
+            "Query Intent",
+            "Discovered At",
+            "Username Match",
+            "@Mention Match",
+            "Comment Match",
+            "Tag Match",
+            "Reel Match",
+            "Post Match",
+            "Different Queries",
+            "Different Snippets",
+        ],
+    )
 
 
 def statistics_dataframe(
@@ -1164,8 +1325,22 @@ def statistics_dataframe(
 
     rows = [
         {
-            "Metric": "Total Unique Results",
+            "Metric": "Unique Instagram URLs",
             "Value": len(results),
+        },
+        {
+            "Metric": "Total Discovery Events",
+            "Value": sum(
+                result.discovery_count
+                for result in results
+            ),
+        },
+        {
+            "Metric": "Distinct Snippets",
+            "Value": sum(
+                result.distinct_snippets
+                for result in results
+            ),
         },
         {
             "Metric": "Comment Matches",
@@ -1182,50 +1357,48 @@ def statistics_dataframe(
             ),
         },
         {
-            "Metric": "Tag Matches",
+            "Metric": "Tagged Matches",
             "Value": sum(
                 result.tag_match
                 for result in results
             ),
         },
         {
-            "Metric": "Reel Matches",
-            "Value": sum(
-                result.reel_match
-                for result in results
+            "Metric": "Instagram Posts",
+            "Value": counter.get(
+                "Instagram Post",
+                0,
             ),
         },
         {
-            "Metric": "Post Matches",
-            "Value": sum(
-                result.post_match
-                for result in results
+            "Metric": "Instagram Reels",
+            "Value": counter.get(
+                "Instagram Reel",
+                0,
             ),
         },
     ]
 
-    for result_type, count in counter.items():
-        rows.append(
-            {
-                "Metric": result_type,
-                "Value": count,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows
+    )
 
 
 def csv_bytes(
     dataframe: pd.DataFrame,
 ) -> bytes:
+
     return dataframe.to_csv(
         index=False
-    ).encode("utf-8-sig")
+    ).encode(
+        "utf-8-sig"
+    )
 
 
 def json_bytes(
     dataframe: pd.DataFrame,
 ) -> bytes:
+
     return json.dumps(
         dataframe.to_dict(
             orient="records"
@@ -1233,12 +1406,14 @@ def json_bytes(
         ensure_ascii=False,
         indent=2,
         default=str,
-    ).encode("utf-8")
+    ).encode(
+        "utf-8"
+    )
 
 
 def excel_bytes(
     results_df: pd.DataFrame,
-    statistics_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
 ) -> bytes:
 
     buffer = io.BytesIO()
@@ -1254,34 +1429,11 @@ def excel_bytes(
             sheet_name="Results",
         )
 
-        statistics_df.to_excel(
+        stats_df.to_excel(
             writer,
             index=False,
             sheet_name="Statistics",
         )
-
-        if not results_df.empty:
-
-            for result_type in sorted(
-                results_df["Type"]
-                .dropna()
-                .unique()
-            ):
-                subset = results_df[
-                    results_df["Type"] == result_type
-                ]
-
-                sheet_name = re.sub(
-                    r"[\[\]:*?/\\]",
-                    "_",
-                    str(result_type),
-                )[:31]
-
-                subset.to_excel(
-                    writer,
-                    index=False,
-                    sheet_name=sheet_name,
-                )
 
     return buffer.getvalue()
 
@@ -1290,83 +1442,80 @@ def render_sidebar() -> dict:
 
     with st.sidebar:
 
-        st.header("Search Settings")
+        st.header(
+            "Google Search Settings"
+        )
 
-        backend = st.selectbox(
-            "Search backend",
-            SUPPORTED_BACKENDS,
-            index=SUPPORTED_BACKENDS.index(
-                DEFAULT_BACKEND
-            ),
-            help=(
-                "Auto is recommended. "
-                "Specific backends can be useful for testing."
-            ),
+        st.success(
+            "Google backend: ACTIVE"
         )
 
         results_per_query = st.slider(
             "Results per query",
-            min_value=3,
-            max_value=20,
-            value=DEFAULT_RESULTS_PER_QUERY,
+            3,
+            20,
+            DEFAULT_RESULTS_PER_QUERY,
         )
 
         max_queries = st.slider(
             "Maximum queries",
-            min_value=10,
-            max_value=100,
-            value=DEFAULT_MAX_QUERIES,
+            10,
+            100,
+            DEFAULT_MAX_QUERIES,
             step=5,
         )
 
         st.divider()
 
-        st.subheader("Speed / Request Pacing")
+        st.subheader(
+            "Speed / Rate Control"
+        )
 
         delay_min = st.slider(
             "Minimum delay",
-            min_value=0.20,
-            max_value=3.0,
-            value=DEFAULT_DELAY_MIN,
-            step=0.05,
+            0.10,
+            3.0,
+            DEFAULT_DELAY_MIN,
+            0.05,
         )
 
         delay_max = st.slider(
             "Maximum delay",
-            min_value=0.20,
-            max_value=5.0,
-            value=DEFAULT_DELAY_MAX,
-            step=0.05,
+            0.10,
+            5.0,
+            DEFAULT_DELAY_MAX,
+            0.05,
         )
 
         timeout = st.slider(
             "Timeout",
-            min_value=5,
-            max_value=30,
-            value=DEFAULT_TIMEOUT,
+            5,
+            30,
+            DEFAULT_TIMEOUT,
         )
 
         retries = st.slider(
             "Retries",
-            min_value=0,
-            max_value=3,
-            value=DEFAULT_RETRIES,
+            0,
+            3,
+            DEFAULT_RETRIES,
         )
 
         st.divider()
 
         region = st.selectbox(
-            "Search region",
+            "Google region",
             [
                 "us-en",
                 "uk-en",
                 "ca-en",
                 "au-en",
                 "in-en",
+                "tr-tr",
+                "ar-sa",
+                "xa-en",
                 "de-de",
                 "fr-fr",
-                "tr-tr",
-                "xa-en",
             ],
             index=0,
         )
@@ -1374,9 +1523,9 @@ def render_sidebar() -> dict:
         safesearch = st.selectbox(
             "SafeSearch",
             [
+                "off",
                 "moderate",
                 "on",
-                "off",
             ],
             index=0,
         )
@@ -1384,16 +1533,14 @@ def render_sidebar() -> dict:
         st.divider()
 
         st.caption(
-            f"Instagram-only mode • v{APP_VERSION}"
+            f"Instagram-only • Google • v{APP_VERSION}"
         )
 
         st.caption(
-            "No login, private-data access, CAPTCHA bypass, "
-            "proxy rotation or authentication bypass."
+            "Public/indexed information only."
         )
 
     return {
-        "backend": backend,
         "results_per_query": results_per_query,
         "max_queries": max_queries,
         "delay_min": min(
@@ -1417,9 +1564,11 @@ def render_live_results(
 ) -> None:
 
     if not results:
+
         placeholder.info(
-            "No Instagram results discovered yet..."
+            "Waiting for the first Google result..."
         )
+
         return
 
     dataframe = results_dataframe(
@@ -1430,15 +1579,23 @@ def render_live_results(
         dataframe,
         use_container_width=True,
         hide_index=True,
-        height=520,
+        height=600,
         column_config={
             "Score": st.column_config.NumberColumn(
                 "Score",
                 format="%d",
             ),
-            "URL": st.column_config.LinkColumn(
-                "URL",
-                display_text="Open",
+            "Discovery Count": st.column_config.NumberColumn(
+                "Discovery Count",
+                format="%d",
+            ),
+            "Distinct Snippets": st.column_config.NumberColumn(
+                "Distinct Snippets",
+                format="%d",
+            ),
+            "Post / Reel URL": st.column_config.LinkColumn(
+                "Post / Reel URL",
+                display_text="Open Instagram",
             ),
             "Title": st.column_config.TextColumn(
                 "Title",
@@ -1461,28 +1618,36 @@ def perform_search(
     settings: dict,
 ) -> None:
 
-    queries = generate_all_queries(
+    queries = generate_queries(
         username=username,
-        max_queries=settings["max_queries"],
+        max_queries=settings[
+            "max_queries"
+        ],
     )
 
     reset_search_state()
 
     st.session_state.searched_username = username
-    st.session_state.total_queries = len(queries)
+    st.session_state.total_queries = len(
+        queries
+    )
     st.session_state.search_running = True
 
-    provider = DDGSSearchProvider(
-        timeout=settings["timeout"]
+    provider = GoogleSearchProvider(
+        timeout=settings[
+            "timeout"
+        ]
     )
 
-    all_results: list[SearchResult] = []
-    seen_urls: set[str] = set()
+    result_store: dict[
+        str,
+        SearchResult,
+    ] = {}
 
-    progress_placeholder = st.empty()
-    status_placeholder = st.empty()
-    live_stats_placeholder = st.empty()
-    results_placeholder = st.empty()
+    progress = st.empty()
+    status = st.empty()
+    live_info = st.empty()
+    live_results = st.empty()
 
     for number, query in enumerate(
         queries,
@@ -1492,28 +1657,33 @@ def perform_search(
         if st.session_state.stop_requested:
             break
 
-        st.session_state.completed_queries = number - 1
-
-        progress_placeholder.progress(
+        progress.progress(
             int(
-                ((number - 1) / len(queries))
+                (
+                    (number - 1)
+                    / max(
+                        len(queries),
+                        1,
+                    )
+                )
                 * 100
             ),
             text=(
-                f"Query {number} / {len(queries)}"
+                f"Google Query "
+                f"{number} / {len(queries)}"
             ),
         )
 
-        status_placeholder.info(
-            f"🔎 **Query {number} / {len(queries)}**\n\n"
+        status.info(
+            f"🔎 **Google Query {number} / {len(queries)}**\n\n"
             f"**Category:** {query.category}\n\n"
             f"**Intent:** {query.intent}\n\n"
             f"`{query.text}`"
         )
 
-        results, error = execute_query(
+        results, error = execute_google_query(
             provider=provider,
-            query=query,
+            search_query=query,
             username=username,
             settings=settings,
         )
@@ -1530,7 +1700,6 @@ def perform_search(
                     "number": number,
                     "query": query.text,
                     "category": query.category,
-                    "intent": query.intent,
                     "error": error,
                 }
             )
@@ -1541,109 +1710,112 @@ def perform_search(
 
             for result in results:
 
-                key = url_key(
-                    result.url
+                merge_result(
+                    result_store,
+                    result,
                 )
 
-                if not key:
-                    continue
-
-                if key in seen_urls:
-                    continue
-
-                seen_urls.add(key)
-                all_results.append(result)
-
-        live_results = deduplicate_results(
-            results=all_results,
-            username=username,
+        current_results = sort_results(
+            result_store
         )
 
-        st.session_state.results = live_results
-        st.session_state.completed_queries = number
+        st.session_state.results = (
+            current_results
+        )
 
-        comment_count = sum(
+        st.session_state.completed_queries = (
+            number
+        )
+
+        comments = sum(
             result.comment_match
-            for result in live_results
+            for result in current_results
         )
 
-        mention_count = sum(
+        mentions = sum(
             result.mention_match
-            for result in live_results
+            for result in current_results
         )
 
-        reel_count = sum(
-            result.reel_match
-            for result in live_results
-        )
-
-        post_count = sum(
+        posts = sum(
             result.post_match
-            for result in live_results
+            for result in current_results
         )
 
-        live_stats_placeholder.markdown(
-            f"""
-**Live Results**
+        reels = sum(
+            result.reel_match
+            for result in current_results
+        )
 
-- Queries completed: **{number}/{len(queries)}**
-- Unique Instagram results: **{len(live_results)}**
-- Comment matches: **{comment_count}**
-- Mention matches: **{mention_count}**
-- Reels: **{reel_count}**
-- Posts: **{post_count}**
+        total_discoveries = sum(
+            result.discovery_count
+            for result in current_results
+        )
+
+        live_info.markdown(
+            f"""
+### Live Google Results
+
+**Unique URLs:** `{len(current_results)}`
+
+**Discovery events:** `{total_discoveries}`
+
+**Comments:** `{comments}`
+
+**Mentions:** `{mentions}`
+
+**Posts:** `{posts}`
+
+**Reels:** `{reels}`
+
+**Failed queries:** `{st.session_state.failed_queries}`
 """
         )
 
         render_live_results(
+            current_results,
             live_results,
-            results_placeholder,
         )
 
-        if number < len(queries):
+        if (
+            number < len(queries)
+            and not st.session_state.stop_requested
+        ):
+
             randomized_delay(
                 settings["delay_min"],
                 settings["delay_max"],
             )
 
-    final_results = deduplicate_results(
-        results=all_results,
-        username=username,
+    final_results = sort_results(
+        result_store
     )
 
-    st.session_state.results = final_results
+    st.session_state.results = (
+        final_results
+    )
+
     st.session_state.search_running = False
     st.session_state.search_completed = True
 
     if st.session_state.stop_requested:
 
-        progress_placeholder.progress(
-            int(
-                (
-                    st.session_state.completed_queries
-                    / max(len(queries), 1)
-                )
-                * 100
-            ),
-            text="Search stopped.",
-        )
-
-        status_placeholder.warning(
+        status.warning(
             f"⏹️ Search stopped after "
-            f"{st.session_state.completed_queries} / "
-            f"{len(queries)} queries."
+            f"{st.session_state.completed_queries} "
+            f"/ {len(queries)} Google queries."
         )
 
     else:
 
-        progress_placeholder.progress(
+        progress.progress(
             100,
-            text="Search completed.",
+            text="Google search completed.",
         )
 
-        status_placeholder.success(
-            f"✅ Search completed — "
-            f"{len(final_results)} unique Instagram results."
+        status.success(
+            f"✅ Google search completed. "
+            f"{len(final_results)} unique Instagram URLs found."
         )
 
 
@@ -1656,38 +1828,38 @@ def render_statistics(
         for result in results
     )
 
-    columns = st.columns(6)
+    cols = st.columns(7)
 
-    columns[0].metric(
-        "Results",
+    cols[0].metric(
+        "Unique URLs",
         len(results),
     )
 
-    columns[1].metric(
+    cols[1].metric(
+        "Discovery Events",
+        sum(
+            r.discovery_count
+            for r in results
+        ),
+    )
+
+    cols[2].metric(
         "Comments",
         sum(
-            result.comment_match
-            for result in results
+            r.comment_match
+            for r in results
         ),
     )
 
-    columns[2].metric(
+    cols[3].metric(
         "Mentions",
         sum(
-            result.mention_match
-            for result in results
+            r.mention_match
+            for r in results
         ),
     )
 
-    columns[3].metric(
-        "Reels",
-        counter.get(
-            "Instagram Reel",
-            0,
-        ),
-    )
-
-    columns[4].metric(
+    cols[4].metric(
         "Posts",
         counter.get(
             "Instagram Post",
@@ -1695,16 +1867,24 @@ def render_statistics(
         ),
     )
 
-    columns[5].metric(
-        "Profiles",
+    cols[5].metric(
+        "Reels",
         counter.get(
-            "Instagram Profile",
+            "Instagram Reel",
             0,
         ),
     )
 
+    cols[6].metric(
+        "Distinct Snippets",
+        sum(
+            r.distinct_snippets
+            for r in results
+        ),
+    )
 
-def render_error_panel() -> None:
+
+def render_errors() -> None:
 
     errors = st.session_state.errors
 
@@ -1712,7 +1892,7 @@ def render_error_panel() -> None:
         return
 
     with st.expander(
-        f"⚠️ Failed queries ({len(errors)})"
+        f"⚠️ Failed Google queries ({len(errors)})"
     ):
 
         for error in errors:
@@ -1733,51 +1913,29 @@ def render_filters(
     )
 
     if dataframe.empty:
-        st.warning(
-            "No indexed Instagram results were found."
-        )
         return dataframe
 
-    st.subheader("Filters")
+    st.subheader(
+        "Result Filters"
+    )
 
-    columns = st.columns(5)
+    cols = st.columns(5)
 
-    with columns[0]:
+    with cols[0]:
+
         types = st.multiselect(
             "Type",
             sorted(
-                dataframe["Type"].unique()
+                dataframe[
+                    "Type"
+                ].unique()
             ),
         )
 
-    with columns[1]:
-        domains = st.multiselect(
-            "Domain",
-            sorted(
-                dataframe["Domain"].unique()
-            ),
-        )
+    with cols[1]:
 
-    with columns[2]:
-
-        max_score = max(
-            int(
-                dataframe["Score"].max()
-            ),
-            1,
-        )
-
-        minimum_score = st.slider(
-            "Minimum score",
-            min_value=0,
-            max_value=max_score,
-            value=0,
-        )
-
-    with columns[3]:
-
-        query_categories = st.multiselect(
-            "Query category",
+        categories = st.multiselect(
+            "Query Category",
             sorted(
                 dataframe[
                     "Query Category"
@@ -1785,34 +1943,79 @@ def render_filters(
             ),
         )
 
-    with columns[4]:
+    with cols[2]:
+
+        max_score = max(
+            int(
+                dataframe[
+                    "Score"
+                ].max()
+            ),
+            1,
+        )
+
+        minimum_score = st.slider(
+            "Minimum Score",
+            0,
+            max_score,
+            0,
+        )
+
+    with cols[3]:
+
+        min_discovery = st.number_input(
+            "Minimum Discovery Count",
+            min_value=1,
+            max_value=max(
+                int(
+                    dataframe[
+                        "Discovery Count"
+                    ].max()
+                ),
+                1,
+            ),
+            value=1,
+        )
+
+    with cols[4]:
 
         search_text = st.text_input(
-            "Search results",
-            placeholder="username, comment, URL...",
+            "Search text",
+            placeholder=(
+                "Search title, snippet, username..."
+            ),
         )
 
     filtered = dataframe.copy()
 
     if types:
+
         filtered = filtered[
-            filtered["Type"].isin(types)
+            filtered["Type"].isin(
+                types
+            )
         ]
 
-    if domains:
-        filtered = filtered[
-            filtered["Domain"].isin(domains)
-        ]
+    if categories:
 
-    if query_categories:
         filtered = filtered[
-            filtered["Query Category"].isin(
-                query_categories
+            filtered[
+                "Query Category"
+            ].isin(
+                categories
             )
         ]
 
     filtered = filtered[
-        filtered["Score"] >= minimum_score
+        filtered["Score"]
+        >= minimum_score
+    ]
+
+    filtered = filtered[
+        filtered[
+            "Discovery Count"
+        ]
+        >= min_discovery
     ]
 
     if search_text.strip():
@@ -1822,7 +2025,9 @@ def render_filters(
         )
 
         mask = (
-            filtered["Title"]
+            filtered[
+                "Title"
+            ]
             .fillna("")
             .str.contains(
                 needle,
@@ -1830,7 +2035,9 @@ def render_filters(
                 regex=True,
             )
             |
-            filtered["URL"]
+            filtered[
+                "Snippet"
+            ]
             .fillna("")
             .str.contains(
                 needle,
@@ -1838,7 +2045,9 @@ def render_filters(
                 regex=True,
             )
             |
-            filtered["Snippet"]
+            filtered[
+                "Post / Reel URL"
+            ]
             .fillna("")
             .str.contains(
                 needle,
@@ -1846,7 +2055,9 @@ def render_filters(
                 regex=True,
             )
             |
-            filtered["Query"]
+            filtered[
+                "Query"
+            ]
             .fillna("")
             .str.contains(
                 needle,
@@ -1855,13 +2066,15 @@ def render_filters(
             )
         )
 
-        filtered = filtered[mask]
+        filtered = filtered[
+            mask
+        ]
 
     return filtered.sort_values(
         by=[
             "Score",
-            "Comment Match",
-            "Mention Match",
+            "Discovery Count",
+            "Distinct Snippets",
         ],
         ascending=[
             False,
@@ -1871,24 +2084,83 @@ def render_filters(
     )
 
 
+def render_snippet_details(
+    results: list[SearchResult],
+) -> None:
+
+    if not results:
+        return
+
+    st.subheader(
+        "Different Indexed Snippets"
+    )
+
+    for index, result in enumerate(
+        results[:50],
+        start=1,
+    ):
+
+        if (
+            len(
+                result.snippets_seen
+            )
+            <= 1
+        ):
+            continue
+
+        with st.expander(
+            f"{index}. {result.title or result.url} "
+            f"— {len(result.snippets_seen)} different snippets"
+        ):
+
+            st.markdown(
+                f"**Instagram URL:** "
+                f"{result.url}"
+            )
+
+            for snippet_number, snippet in enumerate(
+                result.snippets_seen,
+                start=1,
+            ):
+
+                st.markdown(
+                    f"**Snippet {snippet_number}:** "
+                    f"{snippet}"
+                )
+
+            if result.queries_seen:
+
+                st.markdown(
+                    "**Queries that discovered this URL:**"
+                )
+
+                for query in result.queries_seen:
+                    st.code(
+                        query,
+                        language=None,
+                    )
+
+
 def render_exports(
     filtered: pd.DataFrame,
     all_results: list[SearchResult],
 ) -> None:
 
-    st.subheader("Export")
+    st.subheader(
+        "Export"
+    )
 
     all_dataframe = results_dataframe(
         all_results
     )
 
-    statistics = statistics_dataframe(
+    stats_dataframe = statistics_dataframe(
         all_results
     )
 
-    columns = st.columns(3)
+    cols = st.columns(3)
 
-    with columns[0]:
+    with cols[0]:
 
         st.download_button(
             "⬇️ Download CSV",
@@ -1896,22 +2168,22 @@ def render_exports(
                 filtered
             ),
             file_name=(
-                "instagram_public_search.csv"
+                "instagram_google_results.csv"
             ),
             mime="text/csv",
             use_container_width=True,
         )
 
-    with columns[1]:
+    with cols[1]:
 
         st.download_button(
             "⬇️ Download Excel",
             data=excel_bytes(
                 all_dataframe,
-                statistics,
+                stats_dataframe,
             ),
             file_name=(
-                "instagram_public_search.xlsx"
+                "instagram_google_results.xlsx"
             ),
             mime=(
                 "application/vnd.openxmlformats-officedocument."
@@ -1920,7 +2192,7 @@ def render_exports(
             use_container_width=True,
         )
 
-    with columns[2]:
+    with cols[2]:
 
         st.download_button(
             "⬇️ Download JSON",
@@ -1928,7 +2200,7 @@ def render_exports(
                 filtered
             ),
             file_name=(
-                "instagram_public_search.json"
+                "instagram_google_results.json"
             ),
             mime="application/json",
             use_container_width=True,
@@ -1947,18 +2219,18 @@ def main() -> None:
     initialize_session_state()
 
     st.title(
-        "🔎 Instagram Public Comments Discovery"
+        "🔎 Instagram Google Public Discovery"
     )
 
     st.caption(
-        "Instagram-only public/indexed username discovery"
+        "Exact Instagram username / mention discovery "
+        "using Google-indexed public results"
     )
 
     st.info(
-        "Searches public search-engine-indexed Instagram results. "
-        "It does not log into Instagram, access private comments, "
-        "bypass CAPTCHA, bypass authentication, or access Instagram's "
-        "internal/private database."
+        "Instagram only. The application searches public "
+        "search-engine-indexed information. It does not log "
+        "into Instagram or access private comments."
     )
 
     settings = render_sidebar()
@@ -1973,80 +2245,88 @@ def main() -> None:
         disabled=st.session_state.search_running,
     )
 
-    normalized_username = normalize_username(
+    username = normalize_username(
         username_input
     )
 
-    if normalized_username:
+    if username:
+
         st.caption(
-            f"Normalized username: @{normalized_username}"
+            f"Exact search target: @{username}"
         )
 
     controls = st.columns(2)
 
     with controls[0]:
 
-        start_search = st.button(
-            "🚀 START SEARCH",
+        start = st.button(
+            "🚀 START GOOGLE SEARCH",
             type="primary",
             use_container_width=True,
-            disabled=st.session_state.search_running,
+            disabled=(
+                st.session_state.search_running
+            ),
         )
 
     with controls[1]:
 
-        stop_search = st.button(
+        stop = st.button(
             "⏹️ STOP SEARCH",
             use_container_width=True,
-            disabled=not st.session_state.search_running,
+            disabled=(
+                not st.session_state.search_running
+            ),
         )
 
-    if stop_search:
-        request_stop()
+    if stop:
+
+        st.session_state.stop_requested = True
+
         st.warning(
-            "Stop requested. The current search request will finish, "
-            "then the application will stop."
+            "Stop requested. The current Google request "
+            "will finish before the loop stops."
         )
 
-    if start_search:
+    if start:
 
-        username = normalize_username(
-            username_input
-        )
-
-        valid, message = validate_username(
+        valid, error = validate_username(
             username
         )
 
         if not valid:
 
-            st.error(message)
+            st.error(
+                error
+            )
 
         else:
 
-            queries = generate_all_queries(
+            query_preview = generate_queries(
                 username=username,
-                max_queries=settings["max_queries"],
+                max_queries=settings[
+                    "max_queries"
+                ],
             )
 
             with st.expander(
-                f"Generated Instagram queries ({len(queries)})",
+                f"Google queries generated: "
+                f"{len(query_preview)}",
                 expanded=False,
             ):
 
-                query_dataframe = pd.DataFrame(
+                preview_df = pd.DataFrame(
                     [
                         {
-                            "Category": query.category,
-                            "Intent": query.intent,
-                            "Query": query.text,
+                            "Category": q.category,
+                            "Intent": q.intent,
+                            "Google Query": q.text,
                         }
-                        for query in queries
+                        for q in query_preview
                     ]
                 )
 
                 st.dataframe(
-                    query_dataframe,
+                    preview_df,
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -2061,34 +2341,34 @@ def main() -> None:
         st.divider()
 
         st.header(
-            f"Results for @{st.session_state.searched_username}"
+            f"Google Results for @{st.session_state.searched_username}"
         )
 
         render_statistics(
             st.session_state.results
         )
 
-        status_columns = st.columns(2)
+        cols = st.columns(2)
 
-        status_columns[0].success(
-            f"Successful Queries: "
+        cols[0].success(
+            f"Successful Google Queries: "
             f"{st.session_state.successful_queries}"
         )
 
         if st.session_state.failed_queries:
 
-            status_columns[1].warning(
-                f"Failed Queries: "
+            cols[1].warning(
+                f"Failed Google Queries: "
                 f"{st.session_state.failed_queries}"
             )
 
         else:
 
-            status_columns[1].success(
-                "Failed Queries: 0"
+            cols[1].success(
+                "Failed Google Queries: 0"
             )
 
-        render_error_panel()
+        render_errors()
 
         filtered = render_filters(
             st.session_state.results
@@ -2097,22 +2377,30 @@ def main() -> None:
         if not filtered.empty:
 
             st.subheader(
-                f"Results ({len(filtered)})"
+                f"Ranked Results ({len(filtered)})"
             )
 
             st.dataframe(
                 filtered,
                 use_container_width=True,
                 hide_index=True,
-                height=650,
+                height=700,
                 column_config={
                     "Score": st.column_config.NumberColumn(
                         "Score",
                         format="%d",
                     ),
-                    "URL": st.column_config.LinkColumn(
-                        "URL",
-                        display_text="Open",
+                    "Discovery Count": st.column_config.NumberColumn(
+                        "Discovery Count",
+                        format="%d",
+                    ),
+                    "Distinct Snippets": st.column_config.NumberColumn(
+                        "Distinct Snippets",
+                        format="%d",
+                    ),
+                    "Post / Reel URL": st.column_config.LinkColumn(
+                        "Post / Reel URL",
+                        display_text="Open Instagram",
                     ),
                     "Title": st.column_config.TextColumn(
                         "Title",
@@ -2131,6 +2419,12 @@ def main() -> None:
 
             st.divider()
 
+            render_snippet_details(
+                st.session_state.results
+            )
+
+            st.divider()
+
             render_exports(
                 filtered=filtered,
                 all_results=st.session_state.results,
@@ -2138,7 +2432,7 @@ def main() -> None:
 
         else:
 
-            st.info(
+            st.warning(
                 "No results match the current filters."
             )
 
@@ -2147,19 +2441,22 @@ def main() -> None:
         st.divider()
 
         st.subheader(
-            "What this tool searches"
+            "Search model"
         )
 
         st.write(
-            "Instagram posts, Reels, indexed profile pages, "
-            "mentions, tags and public search-engine snippets "
-            "associated with the supplied username."
+            "The tool uses exact quoted username and @username "
+            "queries against Google, with Instagram restricted "
+            "search operators. Results are then classified, "
+            "scored, deduplicated and ranked."
         )
 
         st.warning(
-            "Important: search engines do not expose every Instagram "
-            "comment. A comment that is not publicly indexed cannot be "
-            "recovered by this application."
+            "Google indexing is the limiting factor: if an "
+            "Instagram comment is not publicly indexed by Google, "
+            "this application cannot retrieve that comment. "
+            "Multiple different Google snippets for the same "
+            "Post/Reel are retained and counted when available."
         )
 
 
