@@ -1,96 +1,65 @@
 import io
 import json
-import re
+import math
+import random
 import time
-import hashlib
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pandas as pd
 import streamlit as st
-from ddgs import DDGS
 
 
 # ============================================================
-# APP CONFIGURATION
-# ============================================================
-
-APP_TITLE = "Instagram Public Discovery"
-
-DEFAULT_RESULTS_PER_QUERY = 8
-DEFAULT_DELAY = 0.35
-DEFAULT_MAX_QUERIES = 70
-DEFAULT_RETRIES = 2
-
-# Easy-to-edit scoring weights.
-SCORE_WEIGHTS = {
-    "exact_username": 10,
-    "at_username": 12,
-    "title_username": 6,
-    "instagram_domain": 5,
-    "instagram_post": 8,
-    "instagram_reel": 10,
-    "instagram_tv": 6,
-    "comment_keyword": 4,
-    "mention_keyword": 4,
-    "tag_keyword": 3,
-    "caption_keyword": 3,
-    "profile_keyword": 2,
-}
-
-COMMENT_WORDS = (
-    "comment",
-    "comments",
-    "commented",
-    "reply",
-    "replies",
-)
-
-MENTION_WORDS = (
-    "mention",
-    "mentioned",
-    "mentions",
-)
-
-TAG_WORDS = (
-    "tag",
-    "tagged",
-    "tags",
-)
-
-CAPTION_WORDS = (
-    "caption",
-    "description",
-)
-
-INSTAGRAM_DOMAIN = "instagram.com"
-
-
-# ============================================================
-# STREAMLIT CONFIG
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="📸",
+    page_title="Account Defense Lab",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+APP_NAME = "Account Defense Lab"
+
+PASSWORD_PROFILES = {
+    "Weak": 0.82,
+    "Medium": 0.45,
+    "Strong": 0.08,
+}
+
+SCENARIOS = {
+    "Credential Pressure": {
+        "description": "Simulates repeated authentication pressure.",
+        "base_detection": 0.35,
+    },
+    "Rapid Attempts": {
+        "description": "Simulates a high-frequency automated pattern.",
+        "base_detection": 0.55,
+    },
+    "Distributed Pattern": {
+        "description": "Simulates attempts distributed across synthetic sources.",
+        "base_detection": 0.25,
+    },
+    "Mixed Traffic": {
+        "description": "Simulates normal and suspicious traffic together.",
+        "base_detection": 0.40,
+    },
+}
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-def initialize_state():
+def init_state():
     defaults = {
-        "results": [],
-        "failed_queries": [],
-        "successful_queries": 0,
-        "search_finished": False,
-        "search_running": False,
-        "last_username": "",
-        "query_log": [],
+        "running": False,
+        "completed": False,
+        "events": [],
+        "metrics": {},
+        "report": {},
+        "seed": None,
     }
 
     for key, value in defaults.items():
@@ -98,710 +67,552 @@ def initialize_state():
             st.session_state[key] = value
 
 
-initialize_state()
+init_state()
 
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 
-def now_utc():
+def utc_now():
     return datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
 
-def normalize_username(value):
-    value = (value or "").strip()
-
-    if value.startswith("@"):
-        value = value[1:]
-
-    value = value.strip()
-
-    # Remove accidental Instagram URL input.
-    value = re.sub(
-        r"^https?://(www\.)?instagram\.com/",
-        "",
-        value,
-        flags=re.IGNORECASE,
-    )
-
-    value = value.split("/")[0]
-    value = value.split("?")[0]
-    value = value.strip()
-
-    return value
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
 
 
-def validate_username(username):
-    if not username:
-        return False, "Enter an Instagram username."
+def pct(value, total):
+    if total <= 0:
+        return 0.0
+    return (value / total) * 100
 
-    if len(username) > 30:
-        return False, "Instagram usernames cannot exceed 30 characters."
 
-    if not re.fullmatch(r"[A-Za-z0-9._]+", username):
-        return False, (
-            "Username contains unsupported characters."
+# ============================================================
+# SYNTHETIC TRAFFIC GENERATOR
+# ============================================================
+
+class SyntheticTrafficGenerator:
+
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+
+    def source(self, distributed):
+        if distributed:
+            return (
+                f"SIM-SRC-"
+                f"{self.rng.randint(100, 999)}"
+            )
+
+        return "SIM-SRC-001"
+
+    def password_profile(self, profile):
+        roll = self.rng.random()
+
+        if roll < PASSWORD_PROFILES[profile]:
+            return "synthetic-match"
+
+        return "synthetic-failure"
+
+    def normal_or_suspicious(self, scenario):
+        if scenario == "Rapid Attempts":
+            return "suspicious"
+
+        if scenario == "Distributed Pattern":
+            return (
+                "suspicious"
+                if self.rng.random() < 0.62
+                else "normal"
+            )
+
+        if scenario == "Mixed Traffic":
+            return (
+                "suspicious"
+                if self.rng.random() < 0.50
+                else "normal"
+            )
+
+        return (
+            "suspicious"
+            if self.rng.random() < 0.72
+            else "normal"
         )
 
-    return True, ""
-
-
-def username_regex(username):
-    escaped = re.escape(username)
-
-    return re.compile(
-        rf"(?<![A-Za-z0-9._])@?{escaped}(?![A-Za-z0-9._])",
-        re.IGNORECASE,
-    )
-
-
-def text_contains_username(text, username):
-    if not text:
-        return False
-
-    return bool(
-        username_regex(username).search(text)
-    )
-
-
-def clean_url(url):
-    if not url:
-        return ""
-
-    try:
-        parsed = urlsplit(url)
-
-        removable = {
-            "utm_source",
-            "utm_medium",
-            "utm_campaign",
-            "utm_term",
-            "utm_content",
-            "fbclid",
-            "gclid",
-            "ref",
-        }
-
-        query_items = [
-            (key, value)
-            for key, value in parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-            )
-            if key.lower() not in removable
-        ]
-
-        query = urlencode(query_items)
-
-        cleaned = urlunsplit(
-            (
-                parsed.scheme.lower(),
-                parsed.netloc.lower(),
-                parsed.path.rstrip("/"),
-                query,
-                "",
-            )
-        )
-
-        return cleaned
-
-    except Exception:
-        return url
-
-
-def get_domain(url):
-    try:
-        hostname = urlsplit(url).netloc.lower()
-
-        if hostname.startswith("www."):
-            hostname = hostname[4:]
-
-        return hostname
-
-    except Exception:
-        return ""
-
-
-def is_instagram_url(url):
-    domain = get_domain(url)
-
-    return (
-        domain == INSTAGRAM_DOMAIN
-        or domain.endswith(".instagram.com")
-    )
-
-
-def result_key(result):
-    url = clean_url(result.get("url", ""))
-
-    if url:
-        return hashlib.sha256(
-            url.encode("utf-8")
-        ).hexdigest()
-
-    raw = (
-        result.get("title", "")
-        + "|"
-        + result.get("snippet", "")
-    )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
-
 
 # ============================================================
-# QUERY GENERATOR
+# DEFENSE ENGINE
 # ============================================================
 
-def build_query_groups(username):
-    u = username
-    q = f'"{u}"'
-    aq = f'"@{u}"'
-
-    groups = {
-        "Profile": [
-            f'site:instagram.com "{u}"',
-            f'site:instagram.com "{u}" profile',
-            f'site:instagram.com "@{u}"',
-            f'site:instagram.com/users "{u}"',
-        ],
-
-        "Posts": [
-            f'site:instagram.com/p/ "{u}"',
-            f'site:instagram.com/p/ "@{u}"',
-            f'site:instagram.com/p/ "{u}" Instagram',
-            f'site:instagram.com/p/ {q}',
-            f'site:instagram.com/p/ {aq}',
-        ],
-
-        "Reels": [
-            f'site:instagram.com/reel/ "{u}"',
-            f'site:instagram.com/reel/ "@{u}"',
-            f'site:instagram.com/reels/ "{u}"',
-            f'site:instagram.com/reel/ "{u}" Instagram',
-            f'site:instagram.com/reels/ "@{u}" Instagram',
-        ],
-
-        "Videos": [
-            f'site:instagram.com/tv/ "{u}"',
-            f'site:instagram.com/tv/ "@{u}"',
-            f'site:instagram.com/videos/ "{u}"',
-        ],
-
-        "Comments": [
-            f'site:instagram.com "{u}" comment',
-            f'site:instagram.com "@{u}" comment',
-            f'site:instagram.com "{u}" comments',
-            f'site:instagram.com "@{u}" comments',
-            f'site:instagram.com "{u}" commented',
-            f'site:instagram.com "@{u}" reply',
-            f'site:instagram.com "{u}" replies',
-        ],
-
-        "Mentions": [
-            f'site:instagram.com "{u}" mention',
-            f'site:instagram.com "@{u}" mention',
-            f'site:instagram.com "{u}" mentioned',
-            f'site:instagram.com "@{u}" mentioned',
-            f'site:instagram.com "{u}" mentions',
-        ],
-
-        "Tags": [
-            f'site:instagram.com "{u}" tag',
-            f'site:instagram.com "@{u}" tag',
-            f'site:instagram.com "{u}" tagged',
-            f'site:instagram.com "@{u}" tagged',
-            f'site:instagram.com "{u}" tags',
-        ],
-
-        "Captions": [
-            f'site:instagram.com "{u}" caption',
-            f'site:instagram.com "@{u}" caption',
-            f'site:instagram.com/p/ "{u}" caption',
-            f'site:instagram.com/reel/ "{u}" caption',
-        ],
-
-        "Indexed Content": [
-            f'site:instagram.com "{u}" Instagram',
-            f'site:instagram.com "@{u}" Instagram',
-            f'site:instagram.com "{u}" public',
-            f'site:instagram.com "@{u}" public',
-            f'site:instagram.com "{u}" post',
-            f'site:instagram.com "@{u}" post',
-        ],
-    }
-
-    return groups
-
-
-def generate_queries(username, enabled_groups, max_queries):
-    groups = build_query_groups(username)
-
-    queries = []
-
-    for group_name, group_queries in groups.items():
-
-        if group_name not in enabled_groups:
-            continue
-
-        for query in group_queries:
-
-            query = query.strip()
-
-            if query and query not in queries:
-                queries.append(
-                    {
-                        "query": query,
-                        "category": group_name,
-                    }
-                )
-
-    return queries[:max_queries]
-
-
-# ============================================================
-# CLASSIFICATION
-# ============================================================
-
-def classify_result(url, title, snippet):
-    combined = (
-        f"{title} {snippet} {url}"
-    ).lower()
-
-    path = urlsplit(url).path.lower()
-
-    if "/reel/" in path or "/reels/" in path:
-        return "Reel"
-
-    if "/p/" in path:
-        return "Post"
-
-    if "/tv/" in path:
-        return "Video"
-
-    if (
-        any(word in combined for word in COMMENT_WORDS)
-        and is_instagram_url(url)
-    ):
-        return "Comment-related"
-
-    if (
-        any(word in combined for word in MENTION_WORDS)
-        and is_instagram_url(url)
-    ):
-        return "Mention"
-
-    if (
-        any(word in combined for word in TAG_WORDS)
-        and is_instagram_url(url)
-    ):
-        return "Tag"
-
-    if is_instagram_url(url):
-        return "Instagram"
-
-    return "Other"
-
-
-# ============================================================
-# SCORING
-# ============================================================
-
-def calculate_score(
-    username,
-    title,
-    snippet,
-    url,
-    category,
-):
-    score = 0
-
-    title = title or ""
-    snippet = snippet or ""
-    url = url or ""
-
-    title_lower = title.lower()
-    snippet_lower = snippet.lower()
-    url_lower = url.lower()
-
-    exact_pattern = username_regex(username)
-
-    if exact_pattern.search(snippet):
-        score += SCORE_WEIGHTS["exact_username"]
-
-    if re.search(
-        rf"@{re.escape(username)}",
-        snippet,
-        re.IGNORECASE,
-    ):
-        score += SCORE_WEIGHTS["at_username"]
-
-    if exact_pattern.search(title):
-        score += SCORE_WEIGHTS["title_username"]
-
-    if is_instagram_url(url):
-        score += SCORE_WEIGHTS["instagram_domain"]
-
-    if "/reel/" in url_lower or "/reels/" in url_lower:
-        score += SCORE_WEIGHTS["instagram_reel"]
-
-    if "/p/" in url_lower:
-        score += SCORE_WEIGHTS["instagram_post"]
-
-    if "/tv/" in url_lower:
-        score += SCORE_WEIGHTS["instagram_tv"]
-
-    combined = (
-        f"{title_lower} {snippet_lower}"
-    )
-
-    if any(word in combined for word in COMMENT_WORDS):
-        score += SCORE_WEIGHTS["comment_keyword"]
-
-    if any(word in combined for word in MENTION_WORDS):
-        score += SCORE_WEIGHTS["mention_keyword"]
-
-    if any(word in combined for word in TAG_WORDS):
-        score += SCORE_WEIGHTS["tag_keyword"]
-
-    if any(word in combined for word in CAPTION_WORDS):
-        score += SCORE_WEIGHTS["caption_keyword"]
-
-    if category == "Profile":
-        score += SCORE_WEIGHTS["profile_keyword"]
-
-    return score
-
-
-# ============================================================
-# SEARCH PROVIDER
-# ============================================================
-
-class SearchProvider:
+class DefenseEngine:
 
     def __init__(
         self,
-        max_results=DEFAULT_RESULTS_PER_QUERY,
-        retries=DEFAULT_RETRIES,
+        rate_limit,
+        lockout_threshold,
+        lockout_duration,
+        mfa_enabled,
+        detection_sensitivity,
     ):
-        self.max_results = max_results
-        self.retries = retries
+        self.rate_limit = rate_limit
+        self.lockout_threshold = lockout_threshold
+        self.lockout_duration = lockout_duration
+        self.mfa_enabled = mfa_enabled
+        self.detection_sensitivity = detection_sensitivity
 
-    def search(self, query):
-        last_error = None
+        self.consecutive_failures = 0
+        self.blocked = 0
+        self.rate_limited = 0
+        self.lockouts = 0
+        self.mfa_challenges = 0
+        self.detections = 0
 
-        for attempt in range(
-            self.retries + 1
+        self.locked_until = 0.0
+
+    def evaluate(
+        self,
+        timestamp,
+        suspicious,
+        source,
+        attempts_in_window,
+    ):
+        result = {
+            "status": "ALLOWED",
+            "reason": "",
+            "detection": False,
+            "mfa": False,
+        }
+
+        if timestamp < self.locked_until:
+
+            self.blocked += 1
+
+            result["status"] = "LOCKED"
+            result["reason"] = "Synthetic account lockout active."
+
+            return result
+
+        if attempts_in_window >= self.rate_limit:
+
+            self.rate_limited += 1
+
+            result["status"] = "RATE LIMITED"
+            result["reason"] = "Synthetic rate limit triggered."
+
+            return result
+
+        detection_probability = (
+            self.detection_sensitivity
+            if suspicious
+            else self.detection_sensitivity * 0.12
+        )
+
+        # Repeated activity increases detection likelihood.
+        if attempts_in_window >= max(
+            2,
+            self.rate_limit // 2,
+        ):
+            detection_probability += 0.18
+
+        detection_probability = clamp(
+            detection_probability,
+            0.0,
+            0.98,
+        )
+
+        detected = random.random() < detection_probability
+
+        if detected:
+
+            self.detections += 1
+
+            result["detection"] = True
+            result["reason"] = "Suspicious synthetic behavior detected."
+
+        if self.mfa_enabled and suspicious:
+
+            if random.random() < 0.68:
+
+                self.mfa_challenges += 1
+
+                result["mfa"] = True
+                result["status"] = "MFA CHALLENGE"
+                result["reason"] = (
+                    "Synthetic MFA challenge issued."
+                )
+
+                return result
+
+        return result
+
+    def register_failure(self, timestamp):
+
+        self.consecutive_failures += 1
+
+        if (
+            self.consecutive_failures
+            >= self.lockout_threshold
         ):
 
-            try:
-                with DDGS() as ddgs:
+            self.locked_until = (
+                timestamp
+                + self.lockout_duration
+            )
 
-                    rows = list(
-                        ddgs.text(
-                            query,
-                            max_results=self.max_results,
-                        )
-                    )
+            self.lockouts += 1
+            self.consecutive_failures = 0
 
-                return rows
+            return True
 
-            except Exception as exc:
+        return False
 
-                last_error = exc
-
-                if attempt < self.retries:
-                    time.sleep(
-                        min(
-                            2 ** attempt,
-                            5,
-                        )
-                    )
-
-        raise RuntimeError(
-            str(last_error)
-            if last_error
-            else "Unknown search error."
-        )
+    def reset_failure_counter(self):
+        self.consecutive_failures = 0
 
 
 # ============================================================
-# RESULT NORMALIZATION
+# SIMULATION
 # ============================================================
 
-def normalize_search_result(
-    raw,
-    query,
-    query_category,
-    username,
+def run_simulation(
+    target,
+    attempts,
+    speed,
+    scenario,
+    password_profile,
+    rate_limit,
+    lockout_threshold,
+    lockout_duration,
+    mfa_enabled,
+    detection_sensitivity,
+    distributed_sources,
+    live_placeholder,
+    progress_bar,
+    metrics_placeholder,
+    console_placeholder,
 ):
-    title = str(
-        raw.get("title", "")
-        or ""
-    ).strip()
-
-    url = str(
-        raw.get("href", "")
-        or raw.get("url", "")
-        or ""
-    ).strip()
-
-    snippet = str(
-        raw.get("body", "")
-        or raw.get("snippet", "")
-        or ""
-    ).strip()
-
-    if not url:
-        return None
-
-    url = clean_url(url)
-
-    category = classify_result(
-        url,
-        title,
-        snippet,
-    )
-
-    score = calculate_score(
-        username=username,
-        title=title,
-        snippet=snippet,
-        url=url,
-        category=category,
-    )
-
-    combined_text = (
-        f"{title} {snippet}"
-    )
-
-    username_match = text_contains_username(
-        combined_text,
-        username,
-    )
-
-    mention_match = bool(
-        re.search(
-            rf"@{re.escape(username)}",
-            combined_text,
-            re.IGNORECASE,
+    seed = (
+        hash(
+            (
+                target,
+                attempts,
+                scenario,
+                password_profile,
+            )
         )
+        & 0xFFFFFFFF
     )
 
-    comment_match = any(
-        word in combined_text.lower()
-        for word in COMMENT_WORDS
+    st.session_state.seed = seed
+
+    generator = SyntheticTrafficGenerator(seed)
+
+    defense = DefenseEngine(
+        rate_limit=rate_limit,
+        lockout_threshold=lockout_threshold,
+        lockout_duration=lockout_duration,
+        mfa_enabled=mfa_enabled,
+        detection_sensitivity=detection_sensitivity,
     )
 
-    reel_match = (
-        "/reel/" in url.lower()
-        or "/reels/" in url.lower()
+    events = []
+
+    allowed = 0
+    failed = 0
+    blocked = 0
+    successful_matches = 0
+    normal_requests = 0
+    suspicious_requests = 0
+
+    start_time = time.monotonic()
+
+    for i in range(1, attempts + 1):
+
+        elapsed = time.monotonic() - start_time
+
+        source = generator.source(
+            distributed_sources
+        )
+
+        traffic_type = (
+            generator.normal_or_suspicious(
+                scenario
+            )
+        )
+
+        suspicious = (
+            traffic_type == "suspicious"
+        )
+
+        if suspicious:
+            suspicious_requests += 1
+        else:
+            normal_requests += 1
+
+        # Synthetic rolling request window.
+        recent_events = [
+            e
+            for e in events
+            if (
+                elapsed
+                - e["elapsed"]
+                <= 5.0
+            )
+        ]
+
+        attempts_in_window = len(
+            recent_events
+        )
+
+        defense_result = defense.evaluate(
+            timestamp=elapsed,
+            suspicious=suspicious,
+            source=source,
+            attempts_in_window=attempts_in_window,
+        )
+
+        status = defense_result["status"]
+        reason = defense_result["reason"]
+
+        if status in (
+            "LOCKED",
+            "RATE LIMITED",
+        ):
+
+            blocked += 1
+
+        elif status == "MFA CHALLENGE":
+
+            allowed += 1
+
+        else:
+
+            allowed += 1
+
+        synthetic_credential = (
+            generator.password_profile(
+                password_profile
+            )
+        )
+
+        if (
+            status not in (
+                "LOCKED",
+                "RATE LIMITED",
+            )
+        ):
+
+            if (
+                synthetic_credential
+                == "synthetic-match"
+                and suspicious
+            ):
+
+                successful_matches += 1
+                result = "SYNTHETIC MATCH"
+
+                defense.reset_failure_counter()
+
+            else:
+
+                failed += 1
+
+                locked = defense.register_failure(
+                    elapsed
+                )
+
+                if locked:
+                    status = "LOCKOUT"
+                    reason = (
+                        "Synthetic lockout threshold reached."
+                    )
+                    blocked += 1
+
+        else:
+
+            result = "BLOCKED"
+
+        if status == "MFA CHALLENGE":
+            result = "CHALLENGE"
+
+        elif status == "RATE LIMITED":
+            result = "RATE LIMITED"
+
+        elif status == "LOCKED":
+            result = "LOCKED"
+
+        elif status == "LOCKOUT":
+            result = "LOCKOUT"
+
+        elif (
+            synthetic_credential
+            == "synthetic-match"
+        ):
+            result = "SYNTHETIC MATCH"
+
+        else:
+            result = "FAILED"
+
+        event = {
+            "attempt": i,
+            "elapsed": round(elapsed, 3),
+            "source": source,
+            "traffic": traffic_type,
+            "credential": synthetic_credential,
+            "status": status,
+            "result": result,
+            "reason": reason,
+            "detected": defense_result[
+                "detection"
+            ],
+            "mfa": defense_result["mfa"],
+            "time": utc_now(),
+        }
+
+        events.append(event)
+
+        # Keep the visible console compact.
+        console_placeholder.code(
+            "\n".join(
+                [
+                    (
+                        f"[{e['attempt']:03d}] "
+                        f"{e['traffic'].upper():10} | "
+                        f"{e['source']} | "
+                        f"{e['result']}"
+                    )
+                    for e in events[-16:]
+                ]
+            )
+        )
+
+        completed_pct = i / attempts
+
+        progress_bar.progress(
+            completed_pct
+        )
+
+        detection_pct = pct(
+            defense.detections,
+            i,
+        )
+
+        metrics_placeholder.metric(
+            "Detection Rate",
+            f"{detection_pct:.1f}%",
+        )
+
+        time.sleep(speed)
+
+    duration = time.monotonic() - start_time
+
+    detection_rate = pct(
+        defense.detections,
+        attempts,
     )
 
-    post_match = (
-        "/p/" in url.lower()
+    block_rate = pct(
+        blocked,
+        attempts,
     )
 
-    return {
-        "score": int(score),
-        "category": category,
-        "title": title,
-        "url": url,
-        "snippet": snippet,
-        "domain": get_domain(url),
-        "query": query,
-        "query_category": query_category,
-        "search_backend": "DuckDuckGo",
-        "discovered_at": now_utc(),
-        "username_match": username_match,
-        "mention_match": mention_match,
-        "comment_keyword_match": comment_match,
-        "reel_match": reel_match,
-        "post_match": post_match,
+    defense_effectiveness = clamp(
+        (
+            detection_rate * 0.35
+            + block_rate * 0.35
+            + (
+                100
+                if mfa_enabled
+                else 0
+            )
+            * 0.15
+            + (
+                100
+                if defense.lockouts > 0
+                else 40
+            )
+            * 0.15
+        ),
+        0,
+        100,
+    )
+
+    risk_score = clamp(
+        100 - defense_effectiveness,
+        0,
+        100,
+    )
+
+    if risk_score >= 70:
+        risk_level = "HIGH"
+    elif risk_score >= 40:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    metrics = {
+        "attempts": attempts,
+        "allowed": allowed,
+        "failed": failed,
+        "blocked": blocked,
+        "synthetic_matches": successful_matches,
+        "normal_requests": normal_requests,
+        "suspicious_requests": suspicious_requests,
+        "detections": defense.detections,
+        "rate_limited": defense.rate_limited,
+        "lockouts": defense.lockouts,
+        "mfa_challenges": defense.mfa_challenges,
+        "detection_rate": round(
+            detection_rate,
+            2,
+        ),
+        "block_rate": round(
+            block_rate,
+            2,
+        ),
+        "defense_effectiveness": round(
+            defense_effectiveness,
+            2,
+        ),
+        "risk_score": round(
+            risk_score,
+            2,
+        ),
+        "risk_level": risk_level,
+        "duration_seconds": round(
+            duration,
+            2,
+        ),
     }
 
-
-# ============================================================
-# DEDUPLICATION
-# ============================================================
-
-def merge_result(existing, new):
-    if new["score"] > existing["score"]:
-        existing["score"] = new["score"]
-
-    if (
-        len(new.get("snippet", ""))
-        > len(existing.get("snippet", ""))
-    ):
-        existing["snippet"] = new["snippet"]
-
-    existing["username_match"] = (
-        existing["username_match"]
-        or new["username_match"]
-    )
-
-    existing["mention_match"] = (
-        existing["mention_match"]
-        or new["mention_match"]
-    )
-
-    existing["comment_keyword_match"] = (
-        existing["comment_keyword_match"]
-        or new["comment_keyword_match"]
-    )
-
-    existing["reel_match"] = (
-        existing["reel_match"]
-        or new["reel_match"]
-    )
-
-    existing["post_match"] = (
-        existing["post_match"]
-        or new["post_match"]
-    )
-
-    return existing
-
-
-def deduplicate_results(results):
-    indexed = {}
-
-    for result in results:
-
-        key = result_key(result)
-
-        if key in indexed:
-            indexed[key] = merge_result(
-                indexed[key],
-                result,
-            )
-        else:
-            indexed[key] = result
-
-    output = list(indexed.values())
-
-    output.sort(
-        key=lambda item: (
-            item.get("score", 0),
-            item.get("discovered_at", ""),
+    report = {
+        "application": APP_NAME,
+        "generated_at": utc_now(),
+        "target": target,
+        "scenario": scenario,
+        "password_profile": password_profile,
+        "configuration": {
+            "attempts": attempts,
+            "rate_limit": rate_limit,
+            "lockout_threshold": lockout_threshold,
+            "lockout_duration": lockout_duration,
+            "mfa_enabled": mfa_enabled,
+            "detection_sensitivity": detection_sensitivity,
+            "distributed_sources": distributed_sources,
+        },
+        "metrics": metrics,
+        "note": (
+            "All credentials, targets, sources, "
+            "authentication events and results are synthetic."
         ),
-        reverse=True,
-    )
+    }
 
-    return output
-
-
-# ============================================================
-# DATAFRAME
-# ============================================================
-
-def results_dataframe(results):
-    columns = [
-        "score",
-        "category",
-        "title",
-        "url",
-        "snippet",
-        "domain",
-        "query_category",
-        "search_backend",
-        "query",
-        "discovered_at",
-        "username_match",
-        "mention_match",
-        "comment_keyword_match",
-        "reel_match",
-        "post_match",
-    ]
-
-    if not results:
-        return pd.DataFrame(
-            columns=columns
-        )
-
-    return pd.DataFrame(
-        results,
-        columns=columns,
-    )
-
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-def make_excel(results):
-    output = io.BytesIO()
-
-    df = results_dataframe(results)
-
-    statistics = pd.DataFrame(
-        [
-            {
-                "Metric": "Total Results",
-                "Value": len(results),
-            },
-            {
-                "Metric": "Instagram Results",
-                "Value": sum(
-                    r["category"] == "Instagram"
-                    for r in results
-                ),
-            },
-            {
-                "Metric": "Posts",
-                "Value": sum(
-                    r["category"] == "Post"
-                    for r in results
-                ),
-            },
-            {
-                "Metric": "Reels",
-                "Value": sum(
-                    r["category"] == "Reel"
-                    for r in results
-                ),
-            },
-            {
-                "Metric": "Comment-related",
-                "Value": sum(
-                    r["category"] == "Comment-related"
-                    for r in results
-                ),
-            },
-            {
-                "Metric": "Mentions",
-                "Value": sum(
-                    r["category"] == "Mention"
-                    for r in results
-                ),
-            },
-        ]
-    )
-
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl",
-    ) as writer:
-
-        df.to_excel(
-            writer,
-            sheet_name="Results",
-            index=False,
-        )
-
-        statistics.to_excel(
-            writer,
-            sheet_name="Statistics",
-            index=False,
-        )
-
-    output.seek(0)
-
-    return output.getvalue()
+    st.session_state.events = events
+    st.session_state.metrics = metrics
+    st.session_state.report = report
+    st.session_state.completed = True
+    st.session_state.running = False
 
 
 # ============================================================
@@ -810,75 +621,88 @@ def make_excel(results):
 
 with st.sidebar:
 
-    st.header("⚙️ Search Settings")
+    st.header("⚙️ Lab Configuration")
 
-    results_per_query = st.slider(
-        "Results per query",
-        min_value=3,
-        max_value=30,
-        value=DEFAULT_RESULTS_PER_QUERY,
+    target = st.text_input(
+        "Synthetic account name",
+        value="demo_account",
+        help=(
+            "This is only a label. "
+            "No account is contacted."
+        ),
     )
 
-    delay = st.slider(
-        "Delay between queries",
-        min_value=0.1,
-        max_value=3.0,
-        value=DEFAULT_DELAY,
-        step=0.05,
+    scenario = st.selectbox(
+        "Simulation scenario",
+        list(SCENARIOS.keys()),
     )
 
-    max_queries = st.slider(
-        "Maximum queries",
-        min_value=5,
-        max_value=100,
-        value=DEFAULT_MAX_QUERIES,
+    st.caption(
+        SCENARIOS[scenario]["description"]
     )
 
-    retries = st.slider(
-        "Retries on failure",
-        min_value=0,
-        max_value=3,
-        value=DEFAULT_RETRIES,
+    password_profile = st.selectbox(
+        "Synthetic credential profile",
+        list(PASSWORD_PROFILES.keys()),
+    )
+
+    attempts = st.slider(
+        "Synthetic attempts",
+        10,
+        500,
+        100,
+        10,
+    )
+
+    speed = st.slider(
+        "Animation delay",
+        0.0,
+        0.15,
+        0.02,
+        0.01,
     )
 
     st.divider()
 
-    st.subheader("Query Categories")
+    st.subheader("Defense Controls")
 
-    enabled_groups = []
-
-    for group in [
-        "Profile",
-        "Posts",
-        "Reels",
-        "Videos",
-        "Comments",
-        "Mentions",
-        "Tags",
-        "Captions",
-        "Indexed Content",
-    ]:
-
-        enabled = st.checkbox(
-            group,
-            value=True,
-            key=f"group_{group}",
-        )
-
-        if enabled:
-            enabled_groups.append(group)
-
-    st.divider()
-
-    st.caption(
-        "This application searches public, "
-        "search-engine-indexed information only."
+    rate_limit = st.slider(
+        "Rate limit / 5 sec",
+        2,
+        30,
+        8,
     )
 
-    st.caption(
-        "It does not log into Instagram, bypass "
-        "CAPTCHA, access private content, or "
-        "retrieve Instagram's internal database."
+    lockout_threshold = st.slider(
+        "Lockout threshold",
+        3,
+        20,
+        7,
+    )
+
+    lockout_duration = st.slider(
+        "Lockout duration",
+        1,
+        30,
+        8,
+    )
+
+    detection_sensitivity = st.slider(
+        "Detection sensitivity",
+        0.10,
+        0.95,
+        0.65,
+        0.05,
+    )
+
+    mfa_enabled = st.toggle(
+        "Synthetic MFA",
+        value=True,
+    )
+
+    distributed_sources = st.toggle(
+        "Distributed synthetic sources",
+        value=False,
     )
 
 
@@ -886,542 +710,488 @@ with st.sidebar:
 # HEADER
 # ============================================================
 
-st.title("📸 Instagram Public Discovery")
+st.title("🛡️ Account Defense Lab")
 
-st.write(
-    "Search public web-indexed pages related to an "
-    "Instagram username."
+st.caption(
+    "Offline cybersecurity simulation environment"
 )
+
+st.warning(
+    "Simulation only. No login request, network request, "
+    "password test, or real account access is performed."
+)
+
+st.divider()
 
 
 # ============================================================
-# INPUT
+# TOP CONTROLS
 # ============================================================
 
-username_input = st.text_input(
-    "Instagram Username",
-    placeholder="@example",
-)
+col_a, col_b, col_c = st.columns(3)
 
-username = normalize_username(
-    username_input
-)
+with col_a:
+    start = st.button(
+        "▶️ Start Simulation",
+        type="primary",
+        use_container_width=True,
+    )
 
-if username:
-    st.caption(
-        f"Normalized username: `@{username}`"
+with col_b:
+    reset = st.button(
+        "🔄 Reset",
+        use_container_width=True,
+    )
+
+with col_c:
+    st.metric(
+        "Network Requests",
+        "0",
     )
 
 
+if reset:
+
+    st.session_state.events = []
+    st.session_state.metrics = {}
+    st.session_state.report = {}
+    st.session_state.completed = False
+    st.session_state.running = False
+
+    st.rerun()
+
+
 # ============================================================
-# SEARCH BUTTON
+# START SIMULATION
 # ============================================================
 
-start_search = st.button(
-    "🚀 START SEARCH",
-    type="primary",
-    use_container_width=True,
-)
+if start:
 
-
-# ============================================================
-# SEARCH ENGINE
-# ============================================================
-
-if start_search:
-
-    valid, error_message = validate_username(
-        username
-    )
-
-    if not valid:
-
-        st.error(error_message)
-
-    elif not enabled_groups:
-
+    if not target.strip():
         st.error(
-            "Enable at least one query category."
+            "Enter a synthetic account name."
+        )
+        st.stop()
+
+    st.session_state.running = True
+    st.session_state.completed = False
+    st.session_state.events = []
+
+    st.subheader(
+        "🔴 Live Simulation"
+    )
+
+    progress = st.progress(0)
+
+    status_col, metric_col = st.columns(2)
+
+    with status_col:
+        status_box = st.empty()
+
+    with metric_col:
+        live_detection = st.empty()
+
+    console = st.empty()
+
+    status_box.info(
+        "Starting offline simulation..."
+    )
+
+    run_simulation(
+        target=target.strip(),
+        attempts=attempts,
+        speed=speed,
+        scenario=scenario,
+        password_profile=password_profile,
+        rate_limit=rate_limit,
+        lockout_threshold=lockout_threshold,
+        lockout_duration=lockout_duration,
+        mfa_enabled=mfa_enabled,
+        detection_sensitivity=detection_sensitivity,
+        distributed_sources=distributed_sources,
+        live_placeholder=None,
+        progress_bar=progress,
+        metrics_placeholder=live_detection,
+        console_placeholder=console,
+    )
+
+    status_box.success(
+        "Simulation completed."
+    )
+
+    st.rerun()
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+metrics = st.session_state.metrics
+
+if metrics:
+
+    st.divider()
+
+    st.header("📊 Security Dashboard")
+
+    a, b, c, d, e = st.columns(5)
+
+    a.metric(
+        "Attempts",
+        metrics["attempts"],
+    )
+
+    b.metric(
+        "Blocked",
+        metrics["blocked"],
+    )
+
+    c.metric(
+        "Detected",
+        metrics["detections"],
+    )
+
+    d.metric(
+        "MFA Challenges",
+        metrics["mfa_challenges"],
+    )
+
+    e.metric(
+        "Risk",
+        metrics["risk_level"],
+    )
+
+    st.divider()
+
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    score = metrics[
+        "defense_effectiveness"
+    ]
+
+    st.subheader(
+        "🛡️ Defense Effectiveness"
+    )
+
+    st.progress(
+        score / 100
+    )
+
+    st.write(
+        f"**{score:.1f} / 100**"
+    )
+
+    if metrics["risk_level"] == "LOW":
+
+        st.success(
+            "The simulated defense configuration "
+            "performed well."
+        )
+
+    elif metrics["risk_level"] == "MEDIUM":
+
+        st.warning(
+            "The simulated defense configuration "
+            "has room for improvement."
         )
 
     else:
 
-        queries = generate_queries(
-            username,
-            enabled_groups,
-            max_queries,
+        st.error(
+            "The simulated configuration showed "
+            "significant defensive weaknesses."
         )
 
-        st.session_state.results = []
-        st.session_state.failed_queries = []
-        st.session_state.successful_queries = 0
-        st.session_state.query_log = []
-        st.session_state.search_finished = False
-        st.session_state.search_running = True
-        st.session_state.last_username = username
+    # ========================================================
+    # CHARTS
+    # ========================================================
 
-        provider = SearchProvider(
-            max_results=results_per_query,
-            retries=retries,
+    events_df = pd.DataFrame(
+        st.session_state.events
+    )
+
+    if not events_df.empty:
+
+        st.subheader(
+            "📈 Simulation Metrics"
         )
 
-        progress = st.progress(0)
-        current_query_box = st.empty()
-        result_count_box = st.empty()
-        live_results_box = st.empty()
-        status_box = st.empty()
+        chart_df = pd.DataFrame(
+            {
+                "Attempt": events_df[
+                    "attempt"
+                ],
+                "Detected": events_df[
+                    "detected"
+                ].astype(int),
+                "Blocked": events_df[
+                    "status"
+                ].isin(
+                    [
+                        "LOCKED",
+                        "LOCKOUT",
+                        "RATE LIMITED",
+                    ]
+                ).astype(int),
+                "MFA": events_df[
+                    "mfa"
+                ].astype(int),
+            }
+        )
 
-        accumulated_results = []
-
-        total_queries = len(queries)
-
-        for index, query_info in enumerate(
-            queries,
-            start=1,
-        ):
-
-            query = query_info["query"]
-            query_category = query_info["category"]
-
-            current_query_box.markdown(
-                f"**Query {index} / {total_queries}**  \n"
-                f"`{query}`"
-            )
-
-            progress.progress(
-                index / total_queries
-            )
-
-            try:
-
-                raw_results = provider.search(
-                    query
-                )
-
-                for raw in raw_results:
-
-                    normalized = normalize_search_result(
-                        raw=raw,
-                        query=query,
-                        query_category=query_category,
-                        username=username,
-                    )
-
-                    if normalized:
-                        accumulated_results.append(
-                            normalized
-                        )
-
-                st.session_state.successful_queries += 1
-
-                st.session_state.query_log.append(
-                    {
-                        "query": query,
-                        "category": query_category,
-                        "status": "success",
-                        "time": now_utc(),
-                    }
-                )
-
-                accumulated_results = (
-                    deduplicate_results(
-                        accumulated_results
-                    )
-                )
-
-                # Live result update.
-                result_count_box.metric(
-                    "Results discovered",
-                    len(accumulated_results),
-                )
-
-                # Show results immediately instead of waiting
-                # for the complete search.
-                if accumulated_results:
-
-                    live_df = results_dataframe(
-                        accumulated_results
-                    )
-
-                    live_results_box.dataframe(
-                        live_df[
-                            [
-                                "score",
-                                "category",
-                                "title",
-                                "url",
-                                "snippet",
-                                "domain",
-                            ]
-                        ],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "url": st.column_config.LinkColumn(
-                                "URL",
-                                display_text="Open",
-                            )
-                        },
-                    )
-
-            except Exception as exc:
-
-                error = str(exc)
-
-                st.session_state.failed_queries.append(
-                    {
-                        "query": query,
-                        "category": query_category,
-                        "error": error,
-                        "time": now_utc(),
-                    }
-                )
-
-                st.session_state.query_log.append(
-                    {
-                        "query": query,
-                        "category": query_category,
-                        "status": "failed",
-                        "error": error,
-                        "time": now_utc(),
-                    }
-                )
-
-            if delay > 0:
-                time.sleep(delay)
-
-        st.session_state.results = (
-            deduplicate_results(
-                accumulated_results
+        st.line_chart(
+            chart_df.set_index(
+                "Attempt"
             )
         )
 
-        st.session_state.search_finished = True
-        st.session_state.search_running = False
+        # ====================================================
+        # RESULT DISTRIBUTION
+        # ====================================================
 
-        status_box.success(
-            "Search completed."
+        distribution = (
+            events_df[
+                "result"
+            ]
+            .value_counts()
+            .rename_axis("Result")
+            .reset_index(
+                name="Count"
+            )
         )
 
-        st.rerun()
-
-
-# ============================================================
-# RESULTS
-# ============================================================
-
-results = st.session_state.results
-
-if results:
-
-    st.divider()
-
-    st.header("📊 Results")
-
-    total_results = len(results)
-
-    instagram_count = sum(
-        is_instagram_url(
-            r["url"]
-        )
-        for r in results
-    )
-
-    posts_count = sum(
-        r["category"] == "Post"
-        for r in results
-    )
-
-    reels_count = sum(
-        r["category"] == "Reel"
-        for r in results
-    )
-
-    comments_count = sum(
-        r["category"] == "Comment-related"
-        for r in results
-    )
-
-    mentions_count = sum(
-        r["category"] == "Mention"
-        for r in results
-    )
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-
-    c1.metric(
-        "Total",
-        total_results,
-    )
-
-    c2.metric(
-        "Instagram",
-        instagram_count,
-    )
-
-    c3.metric(
-        "Posts",
-        posts_count,
-    )
-
-    c4.metric(
-        "Reels",
-        reels_count,
-    )
-
-    c5.metric(
-        "Comments",
-        comments_count,
-    )
-
-    c6.metric(
-        "Mentions",
-        mentions_count,
-    )
-
-    # --------------------------------------------------------
-    # Filters
-    # --------------------------------------------------------
-
-    st.subheader("🔎 Filters")
-
-    categories = sorted(
-        set(
-            r["category"]
-            for r in results
-        )
-    )
-
-    domains = sorted(
-        set(
-            r["domain"]
-            for r in results
-        )
-    )
-
-    backends = sorted(
-        set(
-            r["search_backend"]
-            for r in results
-        )
-    )
-
-    f1, f2, f3, f4 = st.columns(4)
-
-    with f1:
-
-        selected_categories = st.multiselect(
-            "Category",
-            categories,
-            default=categories,
+        st.bar_chart(
+            distribution.set_index(
+                "Result"
+            )
         )
 
-    with f2:
+    # ========================================================
+    # METRICS TABLE
+    # ========================================================
 
-        selected_domains = st.multiselect(
-            "Domain",
-            domains,
-            default=domains,
-        )
-
-    with f3:
-
-        selected_backends = st.multiselect(
-            "Backend",
-            backends,
-            default=backends,
-        )
-
-    with f4:
-
-        min_score = st.number_input(
-            "Minimum score",
-            min_value=0,
-            max_value=100,
-            value=0,
-        )
-
-    search_inside = st.text_input(
-        "Search inside results",
-        placeholder="keyword, title, snippet...",
+    st.subheader(
+        "📋 Detailed Metrics"
     )
 
-    filtered = []
-
-    for result in results:
-
-        if (
-            result["category"]
-            not in selected_categories
-        ):
-            continue
-
-        if (
-            result["domain"]
-            not in selected_domains
-        ):
-            continue
-
-        if (
-            result["search_backend"]
-            not in selected_backends
-        ):
-            continue
-
-        if result["score"] < min_score:
-            continue
-
-        if search_inside:
-
-            haystack = (
-                result["title"]
-                + " "
-                + result["snippet"]
-                + " "
-                + result["url"]
-            ).lower()
-
-            if search_inside.lower() not in haystack:
-                continue
-
-        filtered.append(result)
-
-    filtered.sort(
-        key=lambda r: r["score"],
-        reverse=True,
-    )
-
-    st.caption(
-        f"Showing {len(filtered)} of {len(results)} results"
-    )
-
-    # --------------------------------------------------------
-    # Results table
-    # --------------------------------------------------------
-
-    display_df = results_dataframe(
-        filtered
-    )
-
-    if not display_df.empty:
-
-        st.dataframe(
-            display_df[
-                [
-                    "score",
-                    "category",
-                    "title",
-                    "url",
-                    "snippet",
-                    "domain",
-                    "query_category",
-                    "search_backend",
-                    "query",
-                    "discovered_at",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "score": st.column_config.NumberColumn(
-                    "Score",
-                    format="%d",
-                ),
-                "url": st.column_config.LinkColumn(
-                    "URL",
-                    display_text="Open",
+    metrics_table = pd.DataFrame(
+        [
+            {
+                "Metric": "Total attempts",
+                "Value": metrics["attempts"],
+            },
+            {
+                "Metric": "Normal requests",
+                "Value": metrics["normal_requests"],
+            },
+            {
+                "Metric": "Suspicious requests",
+                "Value": metrics["suspicious_requests"],
+            },
+            {
+                "Metric": "Allowed",
+                "Value": metrics["allowed"],
+            },
+            {
+                "Metric": "Failed",
+                "Value": metrics["failed"],
+            },
+            {
+                "Metric": "Blocked",
+                "Value": metrics["blocked"],
+            },
+            {
+                "Metric": "Synthetic matches",
+                "Value": metrics[
+                    "synthetic_matches"
+                ],
+            },
+            {
+                "Metric": "Detections",
+                "Value": metrics["detections"],
+            },
+            {
+                "Metric": "Rate limited",
+                "Value": metrics[
+                    "rate_limited"
+                ],
+            },
+            {
+                "Metric": "Lockouts",
+                "Value": metrics["lockouts"],
+            },
+            {
+                "Metric": "MFA challenges",
+                "Value": metrics[
+                    "mfa_challenges"
+                ],
+            },
+            {
+                "Metric": "Detection rate",
+                "Value": (
+                    f"{metrics['detection_rate']:.2f}%"
                 ),
             },
-        )
-
-    # --------------------------------------------------------
-    # Detailed cards
-    # --------------------------------------------------------
-
-    with st.expander(
-        "📄 Detailed Results",
-        expanded=False,
-    ):
-
-        for number, result in enumerate(
-            filtered,
-            start=1,
-        ):
-
-            st.markdown(
-                f"### #{number} — "
-                f"Score {result['score']} — "
-                f"{result['category']}"
-            )
-
-            st.write(
-                result["title"]
-                or "Untitled"
-            )
-
-            st.link_button(
-                "Open result",
-                result["url"],
-            )
-
-            if result["snippet"]:
-                st.caption(
-                    result["snippet"]
-                )
-
-            st.caption(
-                f"Domain: {result['domain']} | "
-                f"Query: {result['query']}"
-            )
-
-            st.divider()
-
-    # --------------------------------------------------------
-    # Export
-    # --------------------------------------------------------
-
-    st.subheader("📦 Export")
-
-    export_df = results_dataframe(
-        filtered
+            {
+                "Metric": "Block rate",
+                "Value": (
+                    f"{metrics['block_rate']:.2f}%"
+                ),
+            },
+            {
+                "Metric": "Risk score",
+                "Value": metrics["risk_score"],
+            },
+            {
+                "Metric": "Duration",
+                "Value": (
+                    f"{metrics['duration_seconds']:.2f}s"
+                ),
+            },
+        ]
     )
 
-    csv_data = export_df.to_csv(
-        index=False
-    ).encode("utf-8")
+    st.dataframe(
+        metrics_table,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    json_data = json.dumps(
-        filtered,
+    # ========================================================
+    # EVENT LOG
+    # ========================================================
+
+    st.subheader(
+        "🧾 Event Log"
+    )
+
+    st.dataframe(
+        events_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "elapsed": st.column_config.NumberColumn(
+                "Elapsed",
+                format="%.3f",
+            ),
+            "detected": st.column_config.CheckboxColumn(
+                "Detected"
+            ),
+            "mfa": st.column_config.CheckboxColumn(
+                "MFA"
+            ),
+        },
+    )
+
+    # ========================================================
+    # RECOMMENDATIONS
+    # ========================================================
+
+    st.subheader(
+        "💡 Security Recommendations"
+    )
+
+    recommendations = []
+
+    if metrics["detection_rate"] < 50:
+        recommendations.append(
+            "Increase behavioral detection sensitivity."
+        )
+
+    if metrics["block_rate"] < 30:
+        recommendations.append(
+            "Consider stricter rate limiting."
+        )
+
+    if not mfa_enabled:
+        recommendations.append(
+            "Enable MFA for stronger account protection."
+        )
+
+    if metrics["lockouts"] == 0:
+        recommendations.append(
+            "Consider adding an account protection threshold."
+        )
+
+    if metrics["detection_rate"] >= 70:
+        recommendations.append(
+            "Detection performance is strong in this simulation."
+        )
+
+    if metrics["rate_limited"] > 0:
+        recommendations.append(
+            "Rate limiting successfully reduced synthetic traffic pressure."
+        )
+
+    if metrics["mfa_challenges"] > 0:
+        recommendations.append(
+            "MFA successfully added an additional simulated defense layer."
+        )
+
+    for recommendation in recommendations:
+        st.write(
+            f"• {recommendation}"
+        )
+
+    # ========================================================
+    # EXPORT
+    # ========================================================
+
+    st.subheader(
+        "📦 Export"
+    )
+
+    report_json = json.dumps(
+        st.session_state.report,
         ensure_ascii=False,
         indent=2,
     ).encode("utf-8")
 
-    excel_data = make_excel(
-        filtered
-    )
+    events_csv = events_df.to_csv(
+        index=False
+    ).encode("utf-8")
 
-    e1, e2, e3 = st.columns(3)
+    excel_buffer = io.BytesIO()
 
-    with e1:
+    with pd.ExcelWriter(
+        excel_buffer,
+        engine="openpyxl",
+    ) as writer:
+
+        events_df.to_excel(
+            writer,
+            sheet_name="Events",
+            index=False,
+        )
+
+        metrics_table.to_excel(
+            writer,
+            sheet_name="Metrics",
+            index=False,
+        )
+
+    excel_buffer.seek(0)
+
+    x1, x2, x3 = st.columns(3)
+
+    with x1:
 
         st.download_button(
-            "⬇️ Download CSV",
-            data=csv_data,
-            file_name=(
-                f"{username}_instagram_results.csv"
-            ),
+            "⬇️ Events CSV",
+            data=events_csv,
+            file_name="security_simulation_events.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
-    with e2:
+    with x2:
 
         st.download_button(
-            "⬇️ Download Excel",
-            data=excel_data,
-            file_name=(
-                f"{username}_instagram_results.xlsx"
-            ),
+            "⬇️ Excel Report",
+            data=excel_buffer.getvalue(),
+            file_name="security_simulation_report.xlsx",
             mime=(
                 "application/vnd.openxmlformats-"
                 "officedocument.spreadsheetml.sheet"
@@ -1429,89 +1199,24 @@ if results:
             use_container_width=True,
         )
 
-    with e3:
+    with x3:
 
         st.download_button(
-            "⬇️ Download JSON",
-            data=json_data,
-            file_name=(
-                f"{username}_instagram_results.json"
-            ),
+            "⬇️ JSON Report",
+            data=report_json,
+            file_name="security_simulation_report.json",
             mime="application/json",
             use_container_width=True,
         )
 
 
 # ============================================================
-# SEARCH DIAGNOSTICS
+# FOOTER
 # ============================================================
 
-if st.session_state.search_finished:
+st.divider()
 
-    st.divider()
-
-    st.header("🧪 Search Diagnostics")
-
-    q1, q2, q3 = st.columns(3)
-
-    q1.metric(
-        "Successful Queries",
-        st.session_state.successful_queries,
-    )
-
-    q2.metric(
-        "Failed Queries",
-        len(
-            st.session_state.failed_queries
-        ),
-    )
-
-    q3.metric(
-        "Unique Results",
-        len(
-            st.session_state.results
-        ),
-    )
-
-    if st.session_state.failed_queries:
-
-        with st.expander(
-            "⚠️ Failed Queries"
-        ):
-
-            st.dataframe(
-                pd.DataFrame(
-                    st.session_state.failed_queries
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-# ============================================================
-# EMPTY STATE
-# ============================================================
-
-if not results and not st.session_state.search_running:
-
-    st.info(
-        "Enter an Instagram username and press "
-        "START SEARCH."
-    )
-
-    st.markdown(
-        """
-The application searches public search-engine results for:
-
-- Instagram profiles
-- Public indexed posts
-- Public indexed Reels
-- Public indexed videos
-- Mention-related pages
-- Tag-related pages
-- Comment-related snippets
-- Caption-related snippets
-
-Results appear progressively while the search is running.
-        """
-    )
+st.caption(
+    "Account Defense Lab • Offline synthetic security simulator • "
+    "Network Requests: 0"
+)
