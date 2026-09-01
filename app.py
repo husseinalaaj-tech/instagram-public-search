@@ -2,62 +2,41 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
+import string
 import time
-from dataclasses import dataclass, field
-from threading import Lock
-from typing import Dict
+from dataclasses import dataclass
+from typing import Dict, List
 
+import requests
+import streamlit as st
 from fastapi import FastAPI
 from pydantic import BaseModel
+import uvicorn
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 HOST = "127.0.0.1"
-PORT = 8080
+PORT = 8765
+BASE_URL = f"http://{HOST}:{PORT}"
 
-FAKE_USERNAME = "lab_user"
-FAKE_PASSWORD = "LabPassword-2026"
-
-LOCKOUT_THRESHOLD = 5
-LOCKOUT_SECONDS = 30
-
-RATE_LIMIT_MAX = 3
-RATE_LIMIT_WINDOW = 5
-
-DETECTION_THRESHOLD = 3
-
-
-def password_hash(password: str) -> str:
-    return hashlib.sha256(
-        password.encode("utf-8")
-    ).hexdigest()
-
-
-@dataclass
-class AccountState:
-    username: str
-    password_hash: str
-
-    failed_attempts: int = 0
-    locked_until: float = 0.0
-    attempts: list[float] = field(
-        default_factory=list
-    )
-
-
-accounts: Dict[str, AccountState] = {
-    FAKE_USERNAME: AccountState(
-        username=FAKE_USERNAME,
-        password_hash=password_hash(
-            FAKE_PASSWORD
-        ),
-    )
+# Intentionally fictional laboratory accounts.
+LAB_ACCOUNTS = {
+    "researcher": "V7!qR2#nL9@xP4$k",
+    "admin_lab": "Z8@Lm4!Qp7#Wx2$R",
+    "security_lab": "Q4#vN8!sT2@kL7$xP",
 }
 
-state_lock = Lock()
 
-app = FastAPI(
-    title="Local Brute-Force Security Lab",
-    version="1.0.0",
+# ============================================================
+# LOCAL LAB SERVER
+# ============================================================
+
+server = FastAPI(
+    title="Local Authentication Lab",
 )
 
 
@@ -66,157 +45,669 @@ class LoginRequest(BaseModel):
     password: str
 
 
-def now() -> float:
-    return time.time()
+@dataclass
+class AccountState:
+    password_hash: str
+    attempts: int = 0
+    started_at: float | None = None
+    solved: bool = False
 
 
-def is_locked(account: AccountState) -> bool:
-    return now() < account.locked_until
+def hash_password(value: str) -> str:
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
 
 
-def cleanup_attempts(account: AccountState) -> None:
-    cutoff = now() - RATE_LIMIT_WINDOW
-
-    account.attempts = [
-        timestamp
-        for timestamp in account.attempts
-        if timestamp >= cutoff
-    ]
-
-
-def rate_limited(account: AccountState) -> bool:
-    cleanup_attempts(account)
-
-    return len(account.attempts) >= RATE_LIMIT_MAX
-
-
-def detection_triggered(account: AccountState) -> bool:
-    return (
-        account.failed_attempts
-        >= DETECTION_THRESHOLD
+account_state: Dict[str, AccountState] = {
+    username: AccountState(
+        password_hash=hash_password(password)
     )
+    for username, password in LAB_ACCOUNTS.items()
+}
 
 
-@app.get("/health")
+@server.get("/health")
 def health():
     return {
         "status": "ok",
-        "environment": "local",
-        "host": HOST,
+        "environment": "LOCAL_ONLY",
     }
 
 
-@app.get("/lab/account")
-def account_info():
-    return {
-        "username": FAKE_USERNAME,
-        "environment": "LOCAL_TEST_ACCOUNT",
-    }
-
-
-@app.post("/lab/authenticate")
+@server.post("/lab/authenticate")
 def authenticate(request: LoginRequest):
 
-    with state_lock:
+    account = account_state.get(
+        request.username
+    )
 
-        account = accounts.get(
-            request.username
-        )
-
-        if account is None:
-            return {
-                "success": False,
-                "reason": "unknown_account",
-            }
-
-        if is_locked(account):
-
-            remaining = max(
-                0,
-                int(
-                    account.locked_until
-                    - now()
-                ),
-            )
-
-            return {
-                "success": False,
-                "reason": "locked",
-                "remaining_seconds": remaining,
-                "detected": True,
-            }
-
-        if rate_limited(account):
-
-            return {
-                "success": False,
-                "reason": "rate_limited",
-                "detected": True,
-            }
-
-        account.attempts.append(now())
-
-        supplied_hash = password_hash(
-            request.password
-        )
-
-        valid = hmac.compare_digest(
-            supplied_hash,
-            account.password_hash,
-        )
-
-        if valid:
-
-            account.failed_attempts = 0
-
-            return {
-                "success": True,
-                "reason": "authenticated",
-                "detected": False,
-            }
-
-        account.failed_attempts += 1
-
-        locked = (
-            account.failed_attempts
-            >= LOCKOUT_THRESHOLD
-        )
-
-        if locked:
-            account.locked_until = (
-                now() + LOCKOUT_SECONDS
-            )
-
+    if account is None:
         return {
             "success": False,
-            "reason": (
-                "locked"
-                if locked
-                else "invalid_password"
-            ),
-            "failed_attempts":
-                account.failed_attempts,
-            "locked": locked,
-            "detected":
-                detection_triggered(account),
+            "reason": "unknown_account",
         }
 
+    if account.started_at is None:
+        account.started_at = time.perf_counter()
 
-@app.post("/lab/reset")
-def reset_account():
+    account.attempts += 1
 
-    with state_lock:
+    supplied_hash = hash_password(
+        request.password
+    )
 
-        accounts[
-            FAKE_USERNAME
-        ] = AccountState(
-            username=FAKE_USERNAME,
-            password_hash=password_hash(
-                FAKE_PASSWORD
-            ),
+    valid = hmac.compare_digest(
+        supplied_hash,
+        account.password_hash,
+    )
+
+    if valid:
+
+        account.solved = True
+
+        elapsed = (
+            time.perf_counter()
+            - account.started_at
+        )
+
+        return {
+            "success": True,
+            "reason": "password_matched",
+            "attempts": account.attempts,
+            "elapsed": elapsed,
+        }
+
+    return {
+        "success": False,
+        "reason": "invalid_password",
+        "attempts": account.attempts,
+    }
+
+
+@server.post("/lab/reset")
+def reset():
+
+    for username, password in LAB_ACCOUNTS.items():
+
+        account_state[username] = AccountState(
+            password_hash=hash_password(password)
         )
 
     return {
         "success": True,
-        "message": "Local lab account reset.",
     }
+
+
+# ============================================================
+# LOCAL SERVER CONTROL
+# ============================================================
+
+@st.cache_resource
+def start_local_server():
+
+    config = uvicorn.Config(
+        server,
+        host=HOST,
+        port=PORT,
+        log_level="warning",
+    )
+
+    instance = uvicorn.Server(config)
+
+    import threading
+
+    thread = threading.Thread(
+        target=instance.run,
+        daemon=True,
+    )
+
+    thread.start()
+
+    time.sleep(0.5)
+
+    return thread
+
+
+# ============================================================
+# CANDIDATE GENERATION
+# ============================================================
+
+COMMON_PASSWORDS = [
+    "password",
+    "123456",
+    "12345678",
+    "qwerty",
+    "admin",
+    "welcome",
+    "letmein",
+    "password123",
+    "admin123",
+    "researcher",
+    "security",
+]
+
+
+def generate_candidates(
+    mode: str,
+    custom_text: str,
+) -> List[str]:
+
+    if mode == "Common passwords":
+
+        return COMMON_PASSWORDS.copy()
+
+    if mode == "Custom list":
+
+        return [
+            item.strip()
+            for item in custom_text.splitlines()
+            if item.strip()
+        ]
+
+    # Small LOCAL educational search space.
+    if mode == "Small exhaustive":
+
+        alphabet = "abc123"
+
+        candidates = []
+
+        for length in range(1, 5):
+
+            def build(prefix: str, remaining: int):
+
+                if remaining == 0:
+
+                    candidates.append(prefix)
+
+                    return
+
+                for char in alphabet:
+
+                    build(
+                        prefix + char,
+                        remaining - 1,
+                    )
+
+            build("", length)
+
+        return candidates
+
+    return []
+
+
+# ============================================================
+# HTTP CLIENT
+# ============================================================
+
+def local_request(
+    username: str,
+    password: str,
+):
+
+    # Hard safety boundary.
+    url = (
+        f"http://{HOST}:{PORT}"
+        "/lab/authenticate"
+    )
+
+    response = requests.post(
+        url,
+        json={
+            "username": username,
+            "password": password,
+        },
+        timeout=2,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+
+st.set_page_config(
+    page_title="Local Brute-Force Lab",
+    page_icon="🧪",
+    layout="wide",
+)
+
+
+st.title(
+    "🧪 Local Brute-Force Research Lab"
+)
+
+st.caption(
+    "Real HTTP requests against fictional accounts "
+    "running on localhost."
+)
+
+st.warning(
+    "LOCAL LAB ONLY — this application contains "
+    "no external target configuration."
+)
+
+
+# Start local service.
+start_local_server()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("Laboratory Target")
+
+    username = st.selectbox(
+        "Choose fictional account",
+        list(LAB_ACCOUNTS.keys()),
+    )
+
+    st.code(
+        f"{HOST}:{PORT}"
+    )
+
+    st.divider()
+
+    st.write(
+        "Authentication endpoint:"
+    )
+
+    st.code(
+        "/lab/authenticate"
+    )
+
+    if st.button(
+        "Reset Laboratory",
+        use_container_width=True,
+    ):
+
+        try:
+
+            response = requests.post(
+                f"{BASE_URL}/lab/reset",
+                timeout=2,
+            )
+
+            response.raise_for_status()
+
+            st.session_state.results = []
+
+            st.success(
+                "Laboratory reset."
+            )
+
+        except Exception as exc:
+
+            st.error(str(exc))
+
+
+# ============================================================
+# ACCOUNT INFORMATION
+# ============================================================
+
+st.subheader(
+    "Selected Laboratory Account"
+)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+
+    st.metric(
+        "Account",
+        username,
+    )
+
+with col2:
+
+    st.metric(
+        "Target",
+        "127.0.0.1",
+    )
+
+with col3:
+
+    st.metric(
+        "Network",
+        "LOCAL",
+    )
+
+
+with st.expander(
+    "Show laboratory password"
+):
+
+    st.code(
+        LAB_ACCOUNTS[username]
+    )
+
+    st.caption(
+        "This credential belongs only to the "
+        "fictional local laboratory account."
+    )
+
+
+# ============================================================
+# TEST STRATEGY
+# ============================================================
+
+st.subheader(
+    "Candidate Strategy"
+)
+
+mode = st.selectbox(
+    "Mode",
+    [
+        "Common passwords",
+        "Custom list",
+        "Small exhaustive",
+    ],
+)
+
+
+custom_text = ""
+
+if mode == "Custom list":
+
+    custom_text = st.text_area(
+        "Candidates",
+        value=(
+            "password\n"
+            "123456\n"
+            "admin\n"
+            "LabPassword\n"
+        ),
+        height=180,
+    )
+
+
+candidates = generate_candidates(
+    mode,
+    custom_text,
+)
+
+
+st.write(
+    f"Candidates prepared: **{len(candidates)}**"
+)
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if "results" not in st.session_state:
+
+    st.session_state.results = []
+
+
+run = st.button(
+    "▶ RUN LOCAL TEST",
+    type="primary",
+    use_container_width=True,
+)
+
+
+if run:
+
+    try:
+
+        health = requests.get(
+            f"{BASE_URL}/health",
+            timeout=2,
+        )
+
+        health.raise_for_status()
+
+    except Exception:
+
+        st.error(
+            "Local authentication service "
+            "is unavailable."
+        )
+
+        st.stop()
+
+
+    if not candidates:
+
+        st.error(
+            "No candidates were supplied."
+        )
+
+        st.stop()
+
+
+    results = []
+
+    progress = st.progress(0)
+
+    status = st.empty()
+
+    started = time.perf_counter()
+
+    for index, candidate in enumerate(
+        candidates,
+        start=1,
+    ):
+
+        attempt_started = (
+            time.perf_counter()
+        )
+
+        response = local_request(
+            username,
+            candidate,
+        )
+
+        attempt_time = (
+            time.perf_counter()
+            - attempt_started
+        )
+
+        row = {
+            "attempt": index,
+            "candidate": candidate,
+            "success": response.get(
+                "success",
+                False,
+            ),
+            "reason": response.get(
+                "reason",
+                "unknown",
+            ),
+            "request_time_ms":
+                round(
+                    attempt_time * 1000,
+                    3,
+                ),
+        }
+
+        results.append(row)
+
+        status.write(
+            f"Attempt {index}/{len(candidates)} — "
+            f"{row['reason']}"
+        )
+
+        progress.progress(
+            index / len(candidates)
+        )
+
+        if row["success"]:
+
+            break
+
+
+    total_time = (
+        time.perf_counter()
+        - started
+    )
+
+    st.session_state.results = results
+
+    st.success(
+        "Local HTTP authentication test completed."
+    )
+
+    st.metric(
+        "Total runtime",
+        f"{total_time:.4f} seconds",
+    )
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+if st.session_state.results:
+
+    st.divider()
+
+    st.subheader(
+        "Results"
+    )
+
+    results = (
+        st.session_state.results
+    )
+
+    successful = [
+        row
+        for row in results
+        if row["success"]
+    ]
+
+    attempts = len(results)
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+
+        st.metric(
+            "HTTP Requests",
+            attempts,
+        )
+
+    with c2:
+
+        st.metric(
+            "Password Found",
+            "YES"
+            if successful
+            else "NO",
+        )
+
+    with c3:
+
+        st.metric(
+            "Average Request",
+            f"{sum(
+                r['request_time_ms']
+                for r in results
+            ) / attempts:.3f} ms",
+        )
+
+
+    if successful:
+
+        match = successful[0]
+
+        st.success(
+            "Laboratory password matched."
+        )
+
+        st.write(
+            f"Matched candidate: "
+            f"`{match['candidate']}`"
+        )
+
+        st.write(
+            f"Attempts required: "
+            f"`{match['attempt']}`"
+        )
+
+    else:
+
+        st.info(
+            "The supplied candidate set did not "
+            "contain the laboratory password."
+        )
+
+
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+    st.subheader(
+        "Export"
+    )
+
+    dataframe = (
+        __import__("pandas")
+        .DataFrame(results)
+    )
+
+    csv_data = dataframe.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        "Download CSV",
+        csv_data,
+        "local_bruteforce_results.csv",
+        "text/csv",
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# ARCHITECTURE
+# ============================================================
+
+with st.expander(
+    "Architecture"
+):
+
+    st.code(
+        """
+Streamlit UI
+     |
+     | HTTP POST
+     v
+127.0.0.1:8765
+     |
+     v
+FastAPI Authentication Endpoint
+     |
+     v
+Fictional Account Store
+     |
+     v
+SHA-256 + constant-time comparison
+     |
+     v
+Authentication Result
+     |
+     v
+Streamlit Results / CSV
+        """,
+        language="text",
+    )
+
+
+st.divider()
+
+st.caption(
+    "Local Brute-Force Research Lab • "
+    "No external targets are supported."
+)
