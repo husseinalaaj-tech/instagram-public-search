@@ -1,4 +1,4 @@
-# gmail_osint_ultimate.py
+# gmail_osint_fixed.py
 import streamlit as st
 import requests
 import re
@@ -7,12 +7,10 @@ import hashlib
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Tuple, Any
-from functools import lru_cache
-from urllib.parse import urlparse
+from datetime import datetime
+from typing import Dict, Optional, List, Tuple
 
-# ---------------------------- Optional DNS ----------------------------
+# Optional DNS
 try:
     import dns.resolver
     DNS_AVAILABLE = True
@@ -21,28 +19,23 @@ except ImportError:
 
 # ---------------------------- Configuration ----------------------------
 MAX_WORKERS = 8
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 3600
 RETRY_COUNT = 3
 RETRY_BACKOFF = 1
 
 # ---------------------------- Helpers ----------------------------
 def validate_email(email: str) -> bool:
-    """Strict email validation."""
     pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     return re.match(pattern, email) is not None
 
 def is_gmail(email: str) -> bool:
-    domain = email.split('@')[-1].lower()
-    return domain in ["gmail.com", "googlemail.com"]
+    return email.split('@')[-1].lower() in ["gmail.com", "googlemail.com"]
 
-def safe_request(url: str, headers: Dict = None, params: Dict = None, timeout: int = 10) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Make HTTP request with retries and exponential backoff.
-    Returns (data, error_message).
-    """
+def safe_request_json(url: str, headers: Dict = None, timeout: int = 10) -> Tuple[Optional[Dict], Optional[str]]:
+    """GET request returning JSON; returns (data, error)."""
     for attempt in range(RETRY_COUNT):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            resp = requests.get(url, headers=headers, timeout=timeout)
             if resp.status_code == 200:
                 return resp.json(), None
             elif resp.status_code == 429:
@@ -54,12 +47,13 @@ def safe_request(url: str, headers: Dict = None, params: Dict = None, timeout: i
             if attempt == RETRY_COUNT - 1:
                 return None, str(e)
             time.sleep(RETRY_BACKOFF * (2 ** attempt))
+        except json.JSONDecodeError as e:
+            return None, f"Invalid JSON: {str(e)}"
     return None, "Max retries exceeded"
 
-# ---------------------------- OSINT Modules (with caching) ----------------------------
+# ---------------------------- OSINT Modules ----------------------------
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_deliverability(email: str) -> Dict:
-    """Check MX records or A record fallback."""
     domain = email.split('@')[-1]
     result = {"valid_format": validate_email(email), "mx_exists": False, "servers": []}
     try:
@@ -73,36 +67,43 @@ def check_deliverability(email: str) -> Dict:
             result["mx_exists"] = True
             result["servers"] = ["(resolved via A record)"]
             result["method"] = "socket_fallback"
-    except Exception:
-        result["mx_exists"] = False
+    except Exception as e:
+        result["error"] = str(e)
     return result
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_hibp(email: str) -> Dict:
-    """Have I Been Pwned API."""
+    """HIBP returns plain text; handle accordingly."""
     sha1 = hashlib.sha1(email.encode()).hexdigest().upper()
     prefix, suffix = sha1[:5], sha1[5:]
     url = f"https://api.pwnedpasswords.com/range/{prefix}"
-    data, err = safe_request(url)
-    if err:
-        return {"error": err}
-    if data is None:
-        return {"found": False, "count": 0}
-    # data is plain text
-    for line in data.splitlines():
-        if line.startswith(suffix):
-            count = int(line.split(':')[1])
-            return {"found": True, "count": count}
-    return {"found": False, "count": 0}
+    for attempt in range(RETRY_COUNT):
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.startswith(suffix):
+                        count = int(line.split(':')[1])
+                        return {"found": True, "count": count}
+                return {"found": False, "count": 0}
+            elif resp.status_code == 429:
+                time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                continue
+            else:
+                return {"error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            if attempt == RETRY_COUNT - 1:
+                return {"error": str(e)}
+            time.sleep(RETRY_BACKOFF * (2 ** attempt))
+    return {"error": "Max retries exceeded"}
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_emailrep(email: str, api_key: str = "") -> Dict:
-    """EmailRep.io reputation."""
     if not api_key:
         return {"error": "No API key provided"}
     url = f"https://emailrep.io/{email}"
-    headers = {"Key": api_key} if api_key else {}
-    data, err = safe_request(url, headers=headers)
+    headers = {"Key": api_key}
+    data, err = safe_request_json(url, headers=headers)
     if err:
         return {"error": err}
     return {
@@ -114,7 +115,6 @@ def check_emailrep(email: str, api_key: str = "") -> Dict:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_gravatar(email: str) -> Dict:
-    """Gravatar existence."""
     md5 = hashlib.md5(email.lower().encode()).hexdigest()
     url = f"https://www.gravatar.com/avatar/{md5}?d=404&s=200"
     try:
@@ -127,7 +127,6 @@ def check_gravatar(email: str) -> Dict:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_domain_whois(domain: str) -> Dict:
-    """WHOIS lookup (if whois library available)."""
     try:
         import whois
         w = whois.whois(domain)
@@ -139,16 +138,19 @@ def check_domain_whois(domain: str) -> Dict:
             "org": w.org,
             "country": w.country
         }
-    except:
-        return {"error": "WHOIS unavailable"}
+    except ImportError:
+        return {"error": "python-whois module not installed"}
+    except Exception as e:
+        return {"error": f"WHOIS lookup failed: {str(e)}"}
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def check_leaks(email: str) -> Dict:
-    """Leak-check.net public API."""
     url = f"https://leak-check.net/api/public?check={email}"
-    data, err = safe_request(url)
+    data, err = safe_request_json(url)
     if err:
         return {"error": err}
+    if data is None:
+        return {"error": "Empty response from leak API"}
     return {
         "found": data.get("found", False),
         "sources": data.get("sources", [])
@@ -156,14 +158,13 @@ def check_leaks(email: str) -> Dict:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def social_search(email: str, local_part: str, cse_key: str, cse_cx: str) -> List[Dict]:
-    """Google Custom Search for social profiles."""
     if not cse_key or not cse_cx:
         return []
     results = []
     queries = [f'"{email}"', f'"{local_part}"']
     for q in queries:
         url = f"https://www.googleapis.com/customsearch/v1?key={cse_key}&cx={cse_cx}&q={q}"
-        data, err = safe_request(url)
+        data, err = safe_request_json(url)
         if data and "items" in data:
             for item in data["items"][:3]:
                 results.append({
@@ -175,12 +176,11 @@ def social_search(email: str, local_part: str, cse_key: str, cse_cx: str) -> Lis
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def clearbit_enrich(email: str, api_key: str) -> Dict:
-    """Clearbit person/company enrichment."""
     if not api_key:
         return {"error": "No Clearbit key"}
     url = f"https://person.clearbit.com/v2/combined/find?email={email}"
     headers = {"Authorization": f"Bearer {api_key}"}
-    data, err = safe_request(url, headers=headers)
+    data, err = safe_request_json(url, headers=headers)
     if err:
         return {"error": err}
     return {
@@ -188,11 +188,10 @@ def clearbit_enrich(email: str, api_key: str) -> Dict:
         "company": data.get("company")
     }
 
-# ---------------------------- Main Engine ----------------------------
+# ---------------------------- Parallel Engine ----------------------------
 def run_osint(email: str, api_keys: Dict) -> Dict:
-    """Parallel execution of all modules."""
     results = {}
-    progress_bar = st.progress(0, text="Starting OSINT...")
+    progress_bar = st.progress(0, text="Starting...")
     status_text = st.empty()
 
     tasks = [
@@ -202,8 +201,6 @@ def run_osint(email: str, api_keys: Dict) -> Dict:
         ("domain", check_domain_whois, email.split('@')[-1]),
         ("leaks", check_leaks, email),
     ]
-
-    # Add optional API tasks if keys provided
     if api_keys.get("emailrep"):
         tasks.append(("emailrep", check_emailrep, email, api_keys["emailrep"]))
     if api_keys.get("clearbit"):
@@ -211,7 +208,6 @@ def run_osint(email: str, api_keys: Dict) -> Dict:
     if api_keys.get("google_cse") and api_keys.get("google_cx"):
         tasks.append(("social", social_search, email, email.split('@')[0], api_keys["google_cse"], api_keys["google_cx"]))
 
-    # Run in parallel
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_name = {}
         for task in tasks:
@@ -231,7 +227,7 @@ def run_osint(email: str, api_keys: Dict) -> Dict:
             except Exception as e:
                 results[name] = {"error": str(e)}
             completed += 1
-            progress_bar.progress(completed / len(tasks), text=f"Completed {completed}/{len(tasks)}")
+            progress_bar.progress(completed / len(tasks), f"{completed}/{len(tasks)}")
             status_text.text(f"🔄 {name} done")
 
     progress_bar.empty()
@@ -240,19 +236,12 @@ def run_osint(email: str, api_keys: Dict) -> Dict:
 
 # ---------------------------- Streamlit UI ----------------------------
 def render_ui():
-    st.set_page_config(
-        page_title="Gmail‑OSINT Ultimate",
-        page_icon="🔍",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    # Custom CSS
+    st.set_page_config(page_title="Gmail‑OSINT Ultimate", page_icon="🔍", layout="wide")
     st.markdown("""
     <style>
     .main { background: #0d1117; }
     .stButton > button { background: #21262d; color: #58a6ff; border: 1px solid #30363d; border-radius: 6px; width: 100%; font-weight: bold; }
-    .stButton > button:hover { background: #30363d; color: #58a6ff; border-color: #58a6ff; }
+    .stButton > button:hover { background: #30363d; border-color: #58a6ff; }
     .stTextInput > div > div > input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; background: #0d1117; padding: 8px; }
     .stTabs [data-baseweb="tab"] { background: #161b22; color: #c9d1d9; border-radius: 6px; padding: 8px 16px; border: 1px solid #30363d; }
@@ -262,42 +251,37 @@ def render_ui():
     """, unsafe_allow_html=True)
 
     st.title("🔍 Gmail‑OSINT Ultimate")
-    st.caption("Real‑time email intelligence with parallel processing and caching")
+    st.caption("Real‑time email intelligence with parallel processing")
 
-    # Sidebar: API keys
     with st.sidebar:
-        st.header("⚙️ API Keys (optional)")
+        st.header("⚙️ API Keys")
         emailrep_key = st.text_input("EmailRep.io Key", type="password")
         clearbit_key = st.text_input("Clearbit Key", type="password")
         google_cse_key = st.text_input("Google CSE Key", type="password")
         google_cx = st.text_input("Google CSE ID", type="password")
-        st.caption("Get free keys at emailrep.io, clearbit.com, and Google CSE.")
 
         st.divider()
-        st.header("🎯 Target")
         target_email = st.text_input("Gmail address", placeholder="example@gmail.com")
         if st.button("🔎 Run OSINT", use_container_width=True):
             if not target_email:
-                st.warning("Please enter an email.")
+                st.warning("Enter an email.")
             elif not validate_email(target_email):
                 st.error("Invalid email format.")
             else:
-                api_keys = {
+                st.session_state["email"] = target_email
+                st.session_state["api_keys"] = {
                     "emailrep": emailrep_key,
                     "clearbit": clearbit_key,
                     "google_cse": google_cse_key,
                     "google_cx": google_cx
                 }
-                st.session_state["email"] = target_email
-                st.session_state["api_keys"] = api_keys
                 st.session_state["run"] = True
                 st.rerun()
 
-    # Main area
     if "run" in st.session_state and st.session_state["run"]:
         email = st.session_state["email"]
         api_keys = st.session_state["api_keys"]
-        with st.spinner(f"Intelligence gathering on {email}..."):
+        with st.spinner(f"Gathering intel on {email}..."):
             results = run_osint(email, api_keys)
         st.session_state["results"] = results
         st.session_state["run"] = False
@@ -307,16 +291,13 @@ def render_ui():
         results = st.session_state["results"]
         email = st.session_state.get("email", "unknown")
 
-        # Show errors if any
         errors = {k: v for k, v in results.items() if isinstance(v, dict) and "error" in v}
         if errors:
             with st.expander("⚠️ Some modules returned errors", expanded=False):
                 for mod, err in errors.items():
                     st.error(f"{mod}: {err['error']}")
 
-        # Tabs
         tabs = st.tabs(["📊 Dashboard", "🔐 Security", "👤 Identity", "🌐 Web & Domain", "📜 JSON"])
-
         with tabs[0]:
             col1, col2, col3 = st.columns(3)
             deliv = results.get("deliverability", {})
@@ -331,7 +312,6 @@ def render_ui():
             if grav.get("exists"):
                 st.image(grav["url"], width=120, caption="Gravatar")
 
-            # Reputation if available
             rep = results.get("emailrep", {})
             if rep and "reputation" in rep:
                 st.metric("EmailRep Reputation", rep["reputation"])
@@ -368,7 +348,7 @@ def render_ui():
                 if clearbit.get("company"):
                     st.write(f"**Company:** {clearbit['company'].get('name', 'N/A')}")
             else:
-                st.info("No enrichment data (Clearbit key missing or no data).")
+                st.info("No enrichment data.")
 
             if grav.get("exists"):
                 st.write(f"**Gravatar MD5:** `{grav['md5']}`")
@@ -391,13 +371,12 @@ def render_ui():
                 for item in social[:10]:
                     st.markdown(f"- [{item['title']}]({item['link']})")
             else:
-                st.info("No social results (Google CSE not configured or none found).")
+                st.info("No social results.")
 
         with tabs[4]:
             st.subheader("📜 Raw JSON")
             st.json(results)
 
-        # Download button
         if st.button("📥 Export JSON"):
             st.download_button(
                 label="Download",
