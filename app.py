@@ -1,44 +1,41 @@
-# gmail_osint.py
-"""
-Gmail‑OSINT — Professional Email Intelligence Tool
-Streamlit application for comprehensive Gmail‑based OSINT.
-"""
-
 import streamlit as st
 import requests
 import re
 import json
-import dns.resolver
-import whois
 import time
 import hashlib
+import socket
 from datetime import datetime
 from typing import Dict, Optional, List, Tuple
 from urllib.parse import urlparse
 import base64
 
+# Try to import dnspython; fallback gracefully
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+
 # ---------------------------- Configuration ----------------------------
-# Free API keys – you should replace with your own for production
 API_KEYS = {
-    "emailrep": "your_emailrep_api_key",      # Free at https://emailrep.io/
-    "clearbit": "your_clearbit_api_key",      # Free at https://clearbit.com/
-    "hunter": "your_hunter_api_key",          # Free at https://hunter.io/
-    "google_cse": "your_google_cse_key",      # For social search
-    "google_cx": "your_google_cx"             # Custom search engine ID
+    "emailrep": "",
+    "clearbit": "",
+    "hunter": "",
+    "google_cse": "",
+    "google_cx": ""
 }
 
 # ---------------------------- Validators ----------------------------
 def validate_email(email: str) -> bool:
-    """Validate email format using RFC 5322 regex."""
     pattern = r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)"
     return re.match(pattern, email) is not None
 
 def is_gmail(email: str) -> bool:
-    """Check if the email domain is gmail.com or googlemail.com."""
     domain = email.split('@')[-1].lower()
     return domain in ["gmail.com", "googlemail.com"]
 
-# ---------------------------- Core OSINT Modules ----------------------------
+# ---------------------------- Core OSINT Engine ----------------------------
 class GmailOsintEngine:
     def __init__(self, email: str):
         self.email = email
@@ -47,7 +44,6 @@ class GmailOsintEngine:
         self.errors = []
 
     def run_all(self) -> Dict:
-        """Execute all OSINT modules and return aggregated results."""
         with st.spinner("Collecting intelligence..."):
             self._check_deliverability()
             self._check_breaches()
@@ -60,31 +56,39 @@ class GmailOsintEngine:
         return self.results
 
     def _check_deliverability(self):
-        """Validate the email address syntax and domain MX records."""
+        """Check MX records; fallback to A record if dnspython missing."""
+        result = {'valid_format': True, 'mx_exists': False, 'mx_servers': []}
         try:
-            # Basic format already validated
-            # Check MX records for domain
-            mx_records = dns.resolver.resolve(self.domain, 'MX')
-            self.results['deliverability'] = {
-                'valid_format': True,
-                'mx_exists': len(mx_records) > 0,
-                'mx_servers': [str(r.exchange) for r in mx_records]
-            }
+            if DNS_AVAILABLE:
+                mx_records = dns.resolver.resolve(self.domain, 'MX')
+                result['mx_exists'] = len(mx_records) > 0
+                result['mx_servers'] = [str(r.exchange) for r in mx_records]
+                result['method'] = 'dnspython'
+            else:
+                # Fallback: check if domain resolves (A record)
+                try:
+                    socket.gethostbyname(self.domain)
+                    result['mx_exists'] = True
+                    result['mx_servers'] = ['(resolved via A record)']
+                    result['method'] = 'socket_fallback'
+                    self.errors.append("dnspython not installed – MX check limited to A record resolution.")
+                except socket.gaierror:
+                    result['mx_exists'] = False
+                    result['mx_servers'] = []
+                    result['method'] = 'socket_fallback'
         except Exception as e:
             self.errors.append(f"Deliverability check failed: {str(e)}")
-            self.results['deliverability'] = {'valid_format': True, 'mx_exists': False, 'error': str(e)}
+            result['error'] = str(e)
+        self.results['deliverability'] = result
 
     def _check_breaches(self):
-        """Query Have I Been Pwned API for breaches."""
         try:
-            # Hash the email with SHA-1 for HIBP API
             sha1_hash = hashlib.sha1(self.email.encode('utf-8')).hexdigest().upper()
             prefix = sha1_hash[:5]
             suffix = sha1_hash[5:]
             url = f"https://api.pwnedpasswords.com/range/{prefix}"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
-                # Search for the suffix in the response
                 lines = response.text.splitlines()
                 for line in lines:
                     if line.startswith(suffix):
@@ -104,7 +108,6 @@ class GmailOsintEngine:
             self.results['breaches'] = {'error': str(e)}
 
     def _get_reputation(self):
-        """Query EmailRep.io for reputation score and risk."""
         try:
             url = f"https://emailrep.io/{self.email}"
             headers = {'Key': API_KEYS.get('emailrep', '')}
@@ -124,9 +127,7 @@ class GmailOsintEngine:
             self.results['reputation'] = {'error': str(e)}
 
     def _get_gravatar(self):
-        """Fetch Gravatar profile image and associated data."""
         try:
-            # MD5 hash of email
             hash_md5 = hashlib.md5(self.email.lower().encode('utf-8')).hexdigest()
             gravatar_url = f"https://www.gravatar.com/avatar/{hash_md5}?d=404&s=200"
             response = requests.get(gravatar_url, timeout=5)
@@ -143,8 +144,8 @@ class GmailOsintEngine:
             self.results['gravatar'] = {'error': str(e)}
 
     def _get_domain_info(self):
-        """Get WHOIS and MX information for the domain."""
         try:
+            import whois
             domain_info = whois.whois(self.domain)
             self.results['domain'] = {
                 'registrar': domain_info.registrar,
@@ -159,9 +160,7 @@ class GmailOsintEngine:
             self.results['domain'] = {'error': str(e)}
 
     def _check_leaks(self):
-        """Search for email in pastebin leaks (simulated using a free API like leakcheck)."""
         try:
-            # Using leak-check.net free API (no key required for basic)
             url = f"https://leak-check.net/api/public?check={self.email}"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
@@ -178,20 +177,13 @@ class GmailOsintEngine:
             self.results['leaks'] = {'error': str(e)}
 
     def _social_search(self):
-        """Search for social media profiles associated with the email or username."""
-        # Using Google Custom Search API (limited to 100 queries/day for free)
         try:
             cse_key = API_KEYS.get('google_cse')
             cse_cx = API_KEYS.get('google_cx')
             if not cse_key or not cse_cx:
                 self.results['social'] = {'error': 'Google CSE API key not configured'}
                 return
-
-            # Search for email and also for username
-            queries = [
-                f'"{self.email}"',
-                f'"{self.local_part}" intitle:"{self.local_part}"'
-            ]
+            queries = [f'"{self.email}"', f'"{self.local_part}" intitle:"{self.local_part}"']
             social_results = []
             for query in queries:
                 url = f"https://www.googleapis.com/customsearch/v1?key={cse_key}&cx={cse_cx}&q={query}"
@@ -199,7 +191,7 @@ class GmailOsintEngine:
                 if response.status_code == 200:
                     data = response.json()
                     items = data.get('items', [])
-                    for item in items[:5]:  # Limit to 5 results per query
+                    for item in items[:5]:
                         social_results.append({
                             'title': item.get('title'),
                             'link': item.get('link'),
@@ -211,13 +203,11 @@ class GmailOsintEngine:
             self.results['social'] = {'error': str(e)}
 
     def _email_enrichment(self):
-        """Use Clearbit or Hunter.io to get additional profile info."""
         try:
             clearbit_key = API_KEYS.get('clearbit')
             if not clearbit_key:
                 self.results['enrichment'] = {'error': 'Clearbit API key not configured'}
                 return
-            # Clearbit Email API: https://clearbit.com/docs#email-api
             url = f"https://person.clearbit.com/v2/combined/find?email={self.email}"
             headers = {'Authorization': f'Bearer {clearbit_key}'}
             response = requests.get(url, headers=headers, timeout=10)
@@ -242,72 +232,30 @@ def render_ui():
         initial_sidebar_state="expanded"
     )
 
-    # Custom CSS for dark modern look
     st.markdown("""
     <style>
     .main { background: #0d1117; }
     .stButton > button {
-        background: #21262d;
-        color: #58a6ff;
-        border: 1px solid #30363d;
-        border-radius: 6px;
-        width: 100%;
-        font-weight: bold;
-        padding: 10px;
+        background: #21262d; color: #58a6ff; border: 1px solid #30363d; border-radius: 6px; width: 100%; font-weight: bold; padding: 10px;
     }
-    .stButton > button:hover {
-        background: #30363d;
-        color: #58a6ff;
-        border-color: #58a6ff;
-    }
-    .stTextInput > div > div > input {
-        background: #0d1117;
-        color: #c9d1d9;
-        border: 1px solid #30363d;
-        border-radius: 6px;
-        font-family: monospace;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-        background-color: #0d1117;
-        padding: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background: #161b22;
-        color: #c9d1d9;
-        border-radius: 6px;
-        padding: 8px 16px;
-        border: 1px solid #30363d;
-    }
-    .stTabs [aria-selected="true"] {
-        background: #21262d;
-        border-bottom: 2px solid #58a6ff;
-    }
-    .stMarkdown {
-        color: #c9d1d9;
-    }
-    .stMetric > div {
-        background: #161b22;
-        padding: 12px;
-        border-radius: 6px;
-        border: 1px solid #30363d;
-    }
-    .stCodeBlock {
-        background: #0d1117;
-        border: 1px solid #30363d;
-        border-radius: 6px;
-    }
-    .stAlert {
-        background: #161b22;
-        border: 1px solid #30363d;
-    }
+    .stButton > button:hover { background: #30363d; color: #58a6ff; border-color: #58a6ff; }
+    .stTextInput > div > div > input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-family: monospace; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; background-color: #0d1117; padding: 8px; }
+    .stTabs [data-baseweb="tab"] { background: #161b22; color: #c9d1d9; border-radius: 6px; padding: 8px 16px; border: 1px solid #30363d; }
+    .stTabs [aria-selected="true"] { background: #21262d; border-bottom: 2px solid #58a6ff; }
+    .stMarkdown { color: #c9d1d9; }
+    .stMetric > div { background: #161b22; padding: 12px; border-radius: 6px; border: 1px solid #30363d; }
+    .stCodeBlock { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("📧 Gmail‑OSINT")
     st.caption("Professional Email Intelligence Gathering — Gmail‑focused")
 
-    # Sidebar: Input and options
+    # Warn if dnspython is missing
+    if not DNS_AVAILABLE:
+        st.warning("⚠️ `dnspython` not installed – MX checks will be limited. Install it for full functionality: `pip install dnspython`")
+
     with st.sidebar:
         st.header("🔍 Target Email")
         target_email = st.text_input("Enter Gmail address", placeholder="example@gmail.com")
@@ -320,7 +268,6 @@ def render_ui():
 
         st.divider()
         st.subheader("⚙️ API Keys (optional)")
-        st.caption("For better results, add your own API keys")
         api_key_emailrep = st.text_input("EmailRep.io Key", type="password")
         api_key_clearbit = st.text_input("Clearbit Key", type="password")
         if api_key_emailrep:
@@ -331,51 +278,42 @@ def render_ui():
         st.divider()
         st.metric("Results cached", "Yes" if 'results' in st.session_state else "No")
 
-    # Main area
     if 'run' in st.session_state and st.session_state['run']:
         email = st.session_state['email']
         if not validate_email(email):
             st.error("❌ Invalid email format")
             st.session_state['run'] = False
-            return
-        if not is_gmail(email):
-            st.warning("⚠️ This tool is optimized for Gmail addresses. Proceeding anyway...")
+        else:
+            if not is_gmail(email):
+                st.warning("⚠️ This tool is optimized for Gmail addresses. Proceeding anyway...")
+            with st.spinner(f"Collecting intelligence on {email}..."):
+                engine = GmailOsintEngine(email)
+                results = engine.run_all()
+                st.session_state['results'] = results
+                st.session_state['errors'] = engine.errors
+            st.session_state['run'] = False
 
-        # Run the engine
-        with st.spinner(f"Collecting intelligence on {email}..."):
-            engine = GmailOsintEngine(email)
-            results = engine.run_all()
-            st.session_state['results'] = results
-            st.session_state['errors'] = engine.errors
-        st.session_state['run'] = False  # avoid re-run on every refresh
-
-    # Display results if available
     if 'results' in st.session_state:
         results = st.session_state['results']
         errors = st.session_state.get('errors', [])
 
-        # Show errors
         if errors:
             with st.expander("⚠️ Errors encountered", expanded=False):
                 for err in errors:
                     st.error(err)
 
-        # Tabs for different categories
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📋 Overview", "🔐 Security & Breaches", "👤 Identity", "🌐 Domain & Social", "📜 Raw Data"
         ])
 
         with tab1:
             col1, col2, col3 = st.columns(3)
-            # Deliverability
             deliv = results.get('deliverability', {})
             with col1:
                 st.metric("MX Exists", "✅" if deliv.get('mx_exists') else "❌")
-            # Reputation
             rep = results.get('reputation', {})
             with col2:
                 st.metric("Reputation", rep.get('reputation', 'unknown'))
-            # Breaches
             breaches = results.get('breaches', {})
             with col3:
                 if breaches.get('found'):
@@ -383,7 +321,6 @@ def render_ui():
                 else:
                     st.metric("Breaches", "None found")
 
-            # Gravatar
             grav = results.get('gravatar', {})
             if grav.get('exists'):
                 st.image(grav.get('url'), width=100, caption="Gravatar")
@@ -392,19 +329,14 @@ def render_ui():
 
         with tab2:
             st.subheader("🔐 Security Assessment")
-            # Breaches
             if breaches.get('found'):
                 st.error(f"🚨 This email has been exposed in {breaches.get('breach_count')} data breaches!")
                 st.caption("Consider using a unique password and enabling 2FA.")
             else:
                 st.success("✅ No known breaches found in Have I Been Pwned database.")
-
-            # Reputation
             if rep:
                 st.write("**EmailRep.io Risk Assessment:**")
                 st.json(rep)
-
-            # Leaks
             leaks = results.get('leaks', {})
             if leaks.get('found'):
                 st.warning("📢 Email found in paste leaks. Sources: " + ", ".join(leaks.get('sources', [])))
@@ -424,15 +356,12 @@ def render_ui():
                     st.write(f"**Website:** {person['site']}")
             else:
                 st.info("No enrichment data available (API key may be missing or email not found).")
-
-            # Gravatar
             if grav.get('exists'):
                 st.write(f"**Gravatar MD5:** `{grav.get('md5')}`")
                 st.image(grav.get('url'), caption="Profile Picture")
 
         with tab4:
             st.subheader("🌐 Domain & Social Media")
-            # Domain info
             domain_info = results.get('domain', {})
             if 'error' not in domain_info:
                 st.write(f"**Registrar:** {domain_info.get('registrar', 'N/A')}")
@@ -443,7 +372,6 @@ def render_ui():
             else:
                 st.warning("WHOIS data unavailable.")
 
-            # Social search results
             social = results.get('social', [])
             if social and not isinstance(social, dict):
                 st.write("**Social Media / Web Presence:**")
@@ -456,7 +384,6 @@ def render_ui():
             st.subheader("📜 Raw JSON Data")
             st.json(results)
 
-        # Export results
         if st.button("📥 Export JSON"):
             json_str = json.dumps(results, indent=2)
             st.download_button(
@@ -466,6 +393,5 @@ def render_ui():
                 mime="application/json"
             )
 
-# ---------------------------- Entry Point ----------------------------
 if __name__ == "__main__":
     render_ui()
