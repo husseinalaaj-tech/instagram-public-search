@@ -1,54 +1,68 @@
-import sys
+import streamlit as st
 import itertools
 
-def generate_targeted_wordlist(output_file="target_wordlist.txt"):
-    # Target Intelligence Seeds
-    first_names = ["adian", "adyan"]
-    last_names = ["alboherb", "alborebh"]
-    dates = ["24", "02", "2006", "06", "2402", "24022006", "240206", "feb24", "24feb"]
-    separators = ["", ".", "_", "-"]
-    
+st.set_page_config(page_title="Targeted Intelligence Wordlist Generator", layout="centered")
+
+st.title("🎯 OSINT Targeted Wordlist Generator")
+st.write("Streamlit execution interface for high-precision intelligence permutation.")
+
+# Sidebar / Input Configuration
+st.sidebar.header("Target Configuration Seeds")
+f_input = st.sidebar.text_input("First Names (comma separated)", value="adian, adyan")
+l_input = st.sidebar.text_input("Last Names (comma separated)", value="alboherb, alborebh")
+d_input = st.sidebar.text_input("Dates / Years (comma separated)", value="24, 02, 2006, 06, 2402, 24022006, 240206, feb24, 24feb")
+sep_input = st.sidebar.text_input("Separators (comma separated, use space for empty)", value=" ,.,_,-")
+
+if st.button("Generate Wordlist Matrix"):
+    first_names = [x.strip() for x in f_input.split(",")]
+    last_names = [x.strip() for x in l_input.split(",")]
+    dates = [x.strip() for x in d_input.split(",")]
+    separators = [s if s != " " else "" for s in sep_input.split(",")]
+
     wordlist = set()
     
-    # Base combinations (First + Last, Last + First, Emails)
+    # Base combinations
     for f in first_names:
         for l in last_names:
             for sep in separators:
                 wordlist.add(f"{f}{sep}{l}")
                 wordlist.add(f"{l}{sep}{f}")
-                wordlist.add(f"{f}{sep}{l[0]}")
-                wordlist.add(f"{f[0]}{sep}{l}")
+                if l: wordlist.add(f"{f}{sep}{l[0]}")
+                if f: wordlist.add(f"{f[0]}{sep}{l}")
                 
-    # Add birthdate permutations
     base_bases = list(wordlist) + first_names + last_names + ["adian.alborebh", "adian_alborebh"]
     
+    # Add birthdate permutations
     for base in base_bases:
         for d in dates:
             for sep in separators:
                 wordlist.add(f"{base}{sep}{d}")
                 wordlist.add(f"{d}{sep}{base}")
 
-    # Capitalization variations (Title case, UPPER, lower)
+    # Capitalization variations
     final_passwords = set()
     for pwd in wordlist:
+        if not pwd: continue
         final_passwords.add(pwd.lower())
         final_passwords.add(pwd.capitalize())
         final_passwords.add(pwd.upper())
-        # Capitalize both parts if separated
         for sep in ['.', '_', '-']:
             if sep in pwd:
                 parts = pwd.split(sep)
                 final_passwords.add(sep.join([p.capitalize() for p in parts]))
 
-    # Write out to file
-    with open(output_file, "w", encoding="utf-8") as f:
-        for pwd in sorted(final_passwords):
-            f.write(pwd + "\n")
-            
-    print(f"[+] Targeted intelligence wordlist compiled successfully.")
-    print(f"[+] Total unique permutations generated: {len(final_passwords)}")
-    print(f"[+] Output saved to: {output_file}")
-
-if __name__ == "__main__":
-    outfile = sys.argv[1] if len(sys.argv) > 1 else "adian_wordlist.txt"
-    generate_targeted_wordlist(outfile)
+    sorted_list = sorted(list(final_passwords))
+    
+    st.success(f"[+] Compiled successfully! Total unique permutations: {len(sorted_list)}")
+    
+    # Live preview container
+    st.text_area("Wordlist Preview (First 100 entries)", "\n".join(sorted_list[:100]), height=200)
+    
+    # Direct file download payload
+    wordlist_text = "\n".join(sorted_list)
+    st.download_button(
+        label="📥 Download Complete Wordlist (.txt)",
+        data=wordlist_text,
+        file_name="adian_target_wordlist.txt",
+        mime="text/plain"
+    )
