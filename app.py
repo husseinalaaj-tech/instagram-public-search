@@ -3,35 +3,38 @@ import requests
 import json
 import time
 import re
-import socket
-import platform
-import os
-import sys
-import subprocess
 import threading
-import tempfile
-import shutil
-import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import random
+import pandas as pd
+from io import StringIO
+import base64
+import os
+import sys
+import tempfile
+import shutil
+from urllib.parse import urlparse, parse_qs
 
-# استيراد اختياري للمكتبات
+# محاولة استيراد مكتبات البحث (اختيارية)
 try:
-    import keyboard
+    from googlesearch import search as google_search
+    GOOGLE_AVAILABLE = True
 except ImportError:
-    keyboard = None
+    GOOGLE_AVAILABLE = False
 
-try:
-    import win32crypt
-except ImportError:
-    win32crypt = None
+st.set_page_config(
+    page_title="Instagram Comment Extractor",
+    page_icon="💬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.set_page_config(page_title="Instagram Vulnerability Scanner", layout="wide", initial_sidebar_state="expanded")
-
+# تنسيق CSS مخصص
 st.markdown("""
 <style>
     .main { background-color: #0e1117; }
-    .stButton>button { background-color: #ff4b4b; color: white; border-radius: 8px; }
+    .stButton>button { background-color: #ff4b4b; color: white; border-radius: 8px; font-weight: bold; }
     .stTextInput>div>div>input { background-color: #1e1e1e; color: #00ff00; }
     .stTextArea>div>div>textarea { background-color: #1e1e1e; color: #00ff00; font-family: monospace; }
     .success-box { padding: 10px; border-radius: 5px; background-color: #1a472a; border-left: 4px solid #00ff00; }
@@ -40,28 +43,29 @@ st.markdown("""
     .info-box { padding: 10px; border-radius: 5px; background-color: #1a1a47; border-left: 4px solid #4b4bff; }
     pre { background-color: #1e1e1e; padding: 10px; border-radius: 5px; overflow-x: auto; }
     .metric-card { background-color: #1e1e1e; padding: 15px; border-radius: 10px; text-align: center; }
-    .finding-critical { border-left: 4px solid #ff0000; background-color: #2a0a0a; padding: 10px; margin: 5px 0; }
-    .finding-high { border-left: 4px solid #ff6600; background-color: #2a1a0a; padding: 10px; margin: 5px 0; }
-    .finding-medium { border-left: 4px solid #ffcc00; background-color: #2a2a0a; padding: 10px; margin: 5px 0; }
-    .finding-low { border-left: 4px solid #3399ff; background-color: #0a1a2a; padding: 10px; margin: 5px 0; }
-    .finding-info { border-left: 4px solid #66ccff; background-color: #0a2a3a; padding: 10px; margin: 5px 0; }
+    .comment-card { background-color: #1a1a2e; padding: 12px; border-radius: 8px; margin: 8px 0; border-left: 3px solid #ff4b4b; }
+    .post-link { color: #4b8bff; text-decoration: none; }
+    .timestamp { color: #888; font-size: 0.8em; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🔍 Instagram Vulnerability Scanner")
-st.markdown("*Fast reconnaissance and security assessment for Instagram accounts*")
+# عنوان التطبيق
+st.title("💬 Instagram Comment Extractor")
+st.markdown("*Search and extract all comments made by a specific Instagram user across posts and reels*")
 
 # تهيئة حالة الجلسة
-if 'scan_history' not in st.session_state:
-    st.session_state.scan_history = []
-if 'exfil_buffer' not in st.session_state:
-    st.session_state.exfil_buffer = []
-if 'c2_channel' not in st.session_state:
-    st.session_state.c2_channel = None
+if 'search_history' not in st.session_state:
+    st.session_state.search_history = []
+if 'current_results' not in st.session_state:
+    st.session_state.current_results = []
+if 'search_running' not in st.session_state:
+    st.session_state.search_running = False
 
-# ===== CLASSES =====
+# ===== الفئات الأساسية =====
 
-class InstagramScanner:
+class InstagramCommentExtractor:
+    """الماسح الأساسي لاستخراج التعليقات"""
+    
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -71,379 +75,289 @@ class InstagramScanner:
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive"
         })
-        
-    def fetch_profile(self, username):
-        """محاولة جلب البيانات من عدة مصادر"""
-        # المحاولة الأولى: عبر API
-        profile = self._fetch_via_api(username)
-        if profile:
-            return profile
-        
-        # المحاولة الثانية: عبر استخراج البيانات من صفحة الويب (بدون BeautifulSoup)
-        profile = self._fetch_via_web(username)
-        if profile:
-            return profile
-        
-        return None
-
-    def _fetch_via_api(self, username):
-        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        self.csrf_token = None
+        self._init_session()
+    
+    def _init_session(self):
+        """تهيئة الجلسة وجلب توكن CSRF"""
         try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("status") == "ok" and data.get("data", {}).get("user"):
-                    return data["data"]["user"]
-            return None
+            resp = self.session.get("https://www.instagram.com/", timeout=10)
+            self.csrf_token = self.session.cookies.get("csrftoken")
+            self.session.headers.update({"X-CSRFToken": self.csrf_token} if self.csrf_token else {})
         except:
-            return None
-
-    def _fetch_via_web(self, username):
-        """استخراج البيانات من صفحة الويب باستخدام regex فقط"""
-        url = f"https://www.instagram.com/{username}/"
-        try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code != 200:
-                return None
-            
-            html = response.text
-            
-            # البحث عن window._sharedData
-            match = re.search(r'window\._sharedData\s*=\s*({.*?});</script>', html, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                    user_data = data.get("entry_data", {}).get("ProfilePage", [{}])[0].get("graphql", {}).get("user")
-                    if user_data:
-                        return user_data
-                except:
-                    pass
-            
-            # البحث عن أي script يحتوي على "profileUser" أو "graphql"
-            # نبحث عن محتوى script tags
-            script_pattern = r'<script[^>]*>(.*?)</script>'
-            scripts = re.findall(script_pattern, html, re.DOTALL)
-            for script in scripts:
-                # البحث عن JSON object يحتوي على "user"
-                json_match = re.search(r'\{[^{]*"user"[^}]*\}', script)
-                if json_match:
-                    try:
-                        data = json.loads(json_match.group(0))
-                        if "user" in data:
-                            return data["user"]
-                    except:
-                        pass
-                
-                # البحث عن "profileUser"
-                profile_match = re.search(r'"profileUser"\s*:\s*({[^}]*})', script)
-                if profile_match:
-                    try:
-                        user = json.loads(profile_match.group(1))
-                        return user
-                    except:
-                        pass
-                
-                # البحث عن "graphql" ثم "user"
-                graphql_match = re.search(r'"graphql"\s*:\s*{[^}]*"user"\s*:\s*({[^}]*})', script)
-                if graphql_match:
-                    try:
-                        user = json.loads(graphql_match.group(1))
-                        return user
-                    except:
-                        pass
-            
-            return None
-        except Exception as e:
-            return None
-
-    def scan(self, username):
-        """تنفيذ المسح الكامل"""
-        result = {
-            "username": username,
-            "timestamp": datetime.now().isoformat(),
-            "profile": None,
-            "findings": [],
-            "summary": {}
-        }
-
-        profile = self.fetch_profile(username)
-        if not profile:
-            result["findings"].append({
-                "severity": "critical",
-                "title": "Account not found or inaccessible",
-                "description": f"The account @{username} does not exist or the profile is not accessible."
-            })
-            result["summary"]["status"] = "error"
-            return result
-
-        result["profile"] = profile
-        result["summary"]["status"] = "found"
-
-        # إضافة اسم الحساب واسم العرض للتأكيد
-        display_name = profile.get("full_name") or profile.get("username")
-        result["display_name"] = display_name
-
-        findings = []
-        profile_data = profile
-
-        # 1. نوع الحساب
-        is_private = profile_data.get("is_private", False)
-        if is_private:
-            findings.append({
-                "severity": "info",
-                "title": "Private account",
-                "description": "The account is private. Limited information is available."
-            })
+            pass
+    
+    def search_posts(self, username, max_results=50, engine="duckduckgo"):
+        """البحث عن منشورات قد تحتوي على تعليقات من المستخدم"""
+        posts = []
+        if engine == "duckduckgo":
+            posts = self._search_duckduckgo(username, max_results)
+        elif engine == "google" and GOOGLE_AVAILABLE:
+            posts = self._search_google(username, max_results)
         else:
-            findings.append({
-                "severity": "info",
-                "title": "Public account",
-                "description": "The account is public. All profile information is accessible."
-            })
-
-        # 2. موثق
-        is_verified = profile_data.get("is_verified", False)
-        if is_verified:
-            findings.append({
-                "severity": "info",
-                "title": "Verified account",
-                "description": "The account is verified by Instagram."
-            })
-
-        # 3. بريد إلكتروني أو رقم هاتف في السيرة الذاتية
-        bio = profile_data.get("biography", "")
-        if bio:
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            emails = re.findall(email_pattern, bio)
-            if emails:
-                findings.append({
-                    "severity": "high",
-                    "title": "Email address found in bio",
-                    "description": f"The bio contains email address(es): {', '.join(emails)}"
-                })
-            phone_pattern = r'(\+?\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}'
-            phones = re.findall(phone_pattern, bio)
-            if phones:
-                findings.append({
-                    "severity": "high",
-                    "title": "Phone number found in bio",
-                    "description": f"The bio contains phone number(s): {', '.join(phones)}"
-                })
-
-        # 4. رابط خارجي
-        external_url = profile_data.get("external_url")
-        if external_url:
-            findings.append({
-                "severity": "medium",
-                "title": "External URL exposed",
-                "description": f"The account has an external link: {external_url}"
-            })
-            try:
-                resp = requests.get(external_url, timeout=5, allow_redirects=True)
-                if resp.status_code == 200 and ("login" in resp.text.lower() or "signin" in resp.text.lower()):
-                    findings.append({
-                        "severity": "medium",
-                        "title": "External URL leads to a login page",
-                        "description": f"The external URL {external_url} appears to be a login page, which might indicate a related service."
+            posts = self._search_duckduckgo(username, max_results)  # fallback
+        return posts
+    
+    def _search_duckduckgo(self, username, max_results):
+        """البحث عبر DuckDuckGo (HTML)"""
+        query = f'"{username}" site:instagram.com "comment" OR "replied"'
+        url = "https://html.duckduckgo.com/html/"
+        params = {"q": query}
+        posts = []
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                # استخراج الروابط التي تحتوي على instagram.com/p/ أو instagram.com/reel/
+                links = re.findall(r'href="(https?://(?:www\.)?instagram\.com/(?:p|reel)/[^/"]+)"', resp.text)
+                # إزالة التكرارات
+                unique_links = list(dict.fromkeys(links))
+                # أخذ أول max_results
+                for link in unique_links[:max_results]:
+                    shortcode = self._extract_shortcode(link)
+                    if shortcode:
+                        posts.append({"shortcode": shortcode, "url": link, "type": "post" if "/p/" in link else "reel"})
+        except Exception as e:
+            st.warning(f"DuckDuckGo search error: {e}")
+        return posts
+    
+    def _search_google(self, username, max_results):
+        """البحث عبر Google باستخدام مكتبة googlesearch"""
+        posts = []
+        if not GOOGLE_AVAILABLE:
+            return posts
+        query = f'"{username}" site:instagram.com'
+        try:
+            for url in google_search(query, num_results=max_results, lang="en"):
+                if "instagram.com/p/" in url or "instagram.com/reel/" in url:
+                    shortcode = self._extract_shortcode(url)
+                    if shortcode:
+                        posts.append({"shortcode": shortcode, "url": url, "type": "post" if "/p/" in url else "reel"})
+        except Exception as e:
+            st.warning(f"Google search error: {e}")
+        return posts
+    
+    def _extract_shortcode(self, url):
+        """استخراج الكود المختصر من رابط المنشور"""
+        match = re.search(r'instagram\.com/(?:p|reel)/([^/?#]+)', url)
+        return match.group(1) if match else None
+    
+    def get_post_comments(self, shortcode, max_comments=100):
+        """جلب تعليقات منشور معين"""
+        url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=1"
+        comments = []
+        try:
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                # استخراج التعليقات من بيانات JSON
+                graphql = data.get("graphql", {})
+                shortcode_media = graphql.get("shortcode_media", {})
+                edge_media_to_comment = shortcode_media.get("edge_media_to_comment", {})
+                edges = edge_media_to_comment.get("edges", [])
+                for edge in edges:
+                    node = edge.get("node", {})
+                    comment_text = node.get("text", "")
+                    commenter = node.get("owner", {}).get("username", "")
+                    timestamp = node.get("created_at", 0)
+                    comments.append({
+                        "text": comment_text,
+                        "commenter": commenter,
+                        "timestamp": timestamp,
+                        "shortcode": shortcode
                     })
-            except:
-                pass
-
-        # 5. معلومات الاتصال التجارية
-        contact_info = profile_data.get("contact_info", {})
-        if contact_info:
-            if contact_info.get("email"):
-                findings.append({
-                    "severity": "medium",
-                    "title": "Business contact email exposed",
-                    "description": f"Business email: {contact_info['email']}"
-                })
-            if contact_info.get("phone_number"):
-                findings.append({
-                    "severity": "medium",
-                    "title": "Business contact phone exposed",
-                    "description": f"Business phone: {contact_info['phone_number']}"
-                })
-
-        # 6. نسب المتابعين
-        follower_count = profile_data.get("follower_count", 0)
-        following_count = profile_data.get("following_count", 0)
-        if follower_count == 0 and following_count > 0:
-            findings.append({
-                "severity": "low",
-                "title": "Unusual follower/following ratio",
-                "description": f"The account has {follower_count} followers but follows {following_count} people. Could be a bot or inactive account."
-            })
-
-        # 7. الاسم الكامل
-        full_name = profile_data.get("full_name", "")
-        if full_name and len(full_name) > 2:
-            findings.append({
-                "severity": "low",
-                "title": "Full name disclosed",
-                "description": f"The account displays full name: {full_name}"
-            })
-
-        # 8. فئة العمل
-        business_category = profile_data.get("business_category_name")
-        if business_category:
-            findings.append({
-                "severity": "info",
-                "title": "Business category",
-                "description": f"The account is categorized as: {business_category}"
-            })
-
-        # 9. تحذير 2FA
-        findings.append({
-            "severity": "medium",
-            "title": "Two-factor authentication status unknown",
-            "description": "Unable to determine if 2FA is enabled for this account from public data."
-        })
-
-        result["findings"] = findings
-        result["summary"] = {
-            "total_findings": len(findings),
-            "critical": sum(1 for f in findings if f["severity"] == "critical"),
-            "high": sum(1 for f in findings if f["severity"] == "high"),
-            "medium": sum(1 for f in findings if f["severity"] == "medium"),
-            "low": sum(1 for f in findings if f["severity"] == "low"),
-            "info": sum(1 for f in findings if f["severity"] == "info"),
-        }
-        return result
-
-# ===== باقي الكلاسات (Persistence, Exfil, Payload, C2) =====
-# (تم اختصارها هنا، ولكن في الكود النهائي ستكون موجودة كاملة)
-# يمكنك إضافة الكلاسات السابقة كما هي، لكنني سأضعها بشكل مختصر للإيجاز.
+                # قد نحتاج إلى التصفح للصفحات التالية إذا كان هناك أكثر من max_comments
+                # (يمكن تحسينها لاحقاً)
+                return comments[:max_comments]
+        except Exception as e:
+            pass
+        return comments
+    
+    def extract_comments_for_user(self, username, max_posts=50, search_engine="duckduckgo", max_comments_per_post=50):
+        """الوظيفة الرئيسية: استخراج جميع التعليقات من المستخدم"""
+        results = []
+        # البحث عن المنشورات
+        posts = self.search_posts(username, max_posts, search_engine)
+        if not posts:
+            return results, 0
+        
+        total_posts = len(posts)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # معالجة المنشورات بالتوازي
+        def process_post(post):
+            shortcode = post["shortcode"]
+            url = post["url"]
+            comments = self.get_post_comments(shortcode, max_comments_per_post)
+            user_comments = []
+            for c in comments:
+                if c["commenter"].lower() == username.lower():
+                    user_comments.append({
+                        "comment": c["text"],
+                        "post_url": url,
+                        "shortcode": shortcode,
+                        "timestamp": datetime.fromtimestamp(c["timestamp"]).isoformat() if c["timestamp"] else "Unknown",
+                        "commenter": c["commenter"]
+                    })
+            return user_comments
+        
+        processed = 0
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(process_post, post): post for post in posts}
+            for future in as_completed(futures):
+                processed += 1
+                progress = processed / total_posts
+                progress_bar.progress(progress)
+                status_text.text(f"Processing posts: {processed}/{total_posts}")
+                user_comments = future.result()
+                results.extend(user_comments)
+        
+        progress_bar.empty()
+        status_text.empty()
+        return results, total_posts
 
 # ===== واجهة المستخدم =====
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    target_username = st.text_input("Instagram Username", placeholder="Enter username...", value="")
-    st.divider()
+    st.header("⚙️ Search Configuration")
     
-    # الأدوات الإضافية (نفس الكود السابق)
-    with st.expander("🔴 PERSISTENCE"):
-        c2_host = st.text_input("C2 Host", value="127.0.0.1")
-        c2_port = st.number_input("C2 Port", value=4444, min_value=1, max_value=65535)
-        if st.button("Install Persistence"):
-            # هنا يمكنك استخدام كلاس PersistenceEngine
-            st.info("Persistence module available (code not shown for brevity)")
-
-    with st.expander("📤 EXFILTRATION"):
-        if st.button("Extract Chrome Credentials"):
-            # هنا يمكنك استخدام ChromeCredentialExtractor
-            st.info("Exfiltration module available (code not shown for brevity)")
-
-    with st.expander("💀 PAYLOAD GENERATION"):
-        payload_type = st.selectbox("Payload Type", ["reverse_shell", "keylogger", "credential_dumper"])
-        if st.button("Generate Payload"):
-            st.info("Payload generator available (code not shown for brevity)")
-
-    with st.expander("📡 C2 CHANNEL"):
-        if st.button("Start C2 Listener"):
-            st.info("C2 listener available (code not shown for brevity)")
+    target_username = st.text_input("Instagram Username", placeholder="e.g., john_doe", value="")
+    
+    st.subheader("Search Options")
+    search_engine = st.selectbox(
+        "Search Engine",
+        ["DuckDuckGo (recommended)", "Google (if available)"],
+        index=0
+    )
+    engine_key = "duckduckgo" if "DuckDuckGo" in search_engine else "google"
+    
+    max_posts = st.slider("Max posts to search", min_value=5, max_value=100, value=30, step=5)
+    max_comments_per_post = st.slider("Max comments per post", min_value=10, max_value=200, value=50, step=10)
+    
+    st.divider()
+    st.caption("💡 The tool searches for posts where the username might appear in comments, then extracts the actual comments.")
+    st.caption("🔍 Uses search engines to find relevant posts. Results may vary.")
+    
+    if not GOOGLE_AVAILABLE and engine_key == "google":
+        st.warning("Google search library not installed. Fallback to DuckDuckGo.")
+    
+    start_button = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
 
 # الأقسام الرئيسية
-tab1, tab2, tab3 = st.tabs(["🔎 Scan", "📊 History", "📦 Exfil Buffer"])
+tab1, tab2, tab3 = st.tabs(["📊 Results", "📜 History", "ℹ️ Help"])
 
 with tab1:
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.subheader("Start Vulnerability Scan")
-        st.markdown("Enter an Instagram username to perform a comprehensive security assessment.")
-    with col2:
-        scan_button = st.button("🚀 Scan Now", type="primary", use_container_width=True)
-
-    if scan_button:
-        if not target_username:
-            st.error("❌ Please enter a username.")
+    if start_button and target_username:
+        if st.session_state.search_running:
+            st.warning("Search already in progress.")
         else:
-            with st.spinner(f"Scanning @{target_username} ..."):
-                scanner = InstagramScanner()
-                result = scanner.scan(target_username)
+            st.session_state.search_running = True
+            st.session_state.current_results = []
+            
+            try:
+                extractor = InstagramCommentExtractor()
+                with st.spinner(f"Searching and extracting comments for @{target_username}..."):
+                    results, total_posts = extractor.extract_comments_for_user(
+                        username=target_username,
+                        max_posts=max_posts,
+                        search_engine=engine_key,
+                        max_comments_per_post=max_comments_per_post
+                    )
                 
-                if result["summary"]["status"] == "error":
-                    st.error(f"❌ {result['findings'][0]['description']}")
+                st.session_state.current_results = results
+                st.session_state.search_running = False
+                
+                if results:
+                    st.success(f"✅ Found {len(results)} comments from @{target_username} across {total_posts} posts.")
+                    
+                    # عرض الإحصائيات
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Comments Found", len(results))
+                    col2.metric("Posts Scanned", total_posts)
+                    col3.metric("Unique Posts", len(set(r['shortcode'] for r in results)))
+                    
+                    # عرض النتائج في جدول
+                    df = pd.DataFrame(results)
+                    st.dataframe(df[['comment', 'post_url', 'timestamp']], use_container_width=True)
+                    
+                    # عرض كل تعليق بشكل بطاقة
+                    st.subheader("Comments List")
+                    for idx, row in df.iterrows():
+                        st.markdown(f"""
+                        <div class="comment-card">
+                            <div><strong>💬</strong> {row['comment']}</div>
+                            <div><a href="{row['post_url']}" target="_blank" class="post-link">🔗 View Post</a> <span class="timestamp">{row['timestamp']}</span></div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # زر تصدير CSV
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    b64 = base64.b64encode(csv).decode()
+                    href = f'<a href="data:file/csv;base64,{b64}" download="comments_{target_username}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv">📥 Download CSV</a>'
+                    st.markdown(href, unsafe_allow_html=True)
+                    
+                    # حفظ في التاريخ
+                    st.session_state.search_history.append({
+                        "username": target_username,
+                        "timestamp": datetime.now().isoformat(),
+                        "total_comments": len(results),
+                        "posts_scanned": total_posts,
+                        "results": results
+                    })
                 else:
-                    st.success(f"✅ Scan completed for @{target_username}")
-                    
-                    # عرض اسم الحساب واسم العرض للتأكيد
-                    display_name = result.get("display_name", target_username)
-                    st.info(f"**Account found:** @{target_username} - {display_name}")
-                    
-                    # ملخص سريع
-                    summary = result["summary"]
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    col1.metric("Critical", summary.get("critical", 0))
-                    col2.metric("High", summary.get("high", 0))
-                    col3.metric("Medium", summary.get("medium", 0))
-                    col4.metric("Low", summary.get("low", 0))
-                    col5.metric("Info", summary.get("info", 0))
-                    
-                    # عرض التفاصيل
-                    st.subheader("Profile Information")
-                    profile = result["profile"]
-                    if profile:
-                        info_data = {
-                            "Full Name": profile.get("full_name", "N/A"),
-                            "Username": profile.get("username", "N/A"),
-                            "Public": "✅" if not profile.get("is_private") else "🔒",
-                            "Verified": "✅" if profile.get("is_verified") else "❌",
-                            "Followers": profile.get("follower_count", 0),
-                            "Following": profile.get("following_count", 0),
-                            "Posts": profile.get("media_count", 0),
-                            "Business Category": profile.get("business_category_name", "N/A"),
-                            "External URL": profile.get("external_url", "N/A"),
-                            "Bio": profile.get("biography", "N/A")[:200] + "..."
-                        }
-                        st.json(info_data)
-                    
-                    # عرض النتائج التفصيلية
-                    st.subheader("Findings")
-                    findings = result["findings"]
-                    if findings:
-                        for finding in findings:
-                            severity = finding["severity"]
-                            css_class = {
-                                "critical": "finding-critical",
-                                "high": "finding-high",
-                                "medium": "finding-medium",
-                                "low": "finding-low",
-                                "info": "finding-info"
-                            }.get(severity, "finding-info")
-                            st.markdown(f"""
-                            <div class="{css_class}">
-                                <strong>[{severity.upper()}]</strong> {finding["title"]}<br>
-                                {finding["description"]}
-                            </div>
-                            """, unsafe_allow_html=True)
-                    else:
-                        st.info("No findings detected.")
-                    
-                    # حفظ السجل
-                    st.session_state.scan_history.append(result)
+                    st.warning(f"❌ No comments found for @{target_username}. Try adjusting search parameters or username.")
+            
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+                st.session_state.search_running = False
+    
+    # عرض النتائج الحالية إذا كانت موجودة
+    if not start_button and st.session_state.current_results:
+        results = st.session_state.current_results
+        st.success(f"Showing last results: {len(results)} comments found.")
+        df = pd.DataFrame(results)
+        st.dataframe(df[['comment', 'post_url', 'timestamp']], use_container_width=True)
+        # إلخ...
 
 with tab2:
-    st.subheader("Scan History")
-    if st.session_state.scan_history:
-        for idx, record in enumerate(reversed(st.session_state.scan_history)):
-            with st.expander(f"Scan #{len(st.session_state.scan_history)-idx} - @{record['username']} - {record['timestamp']}"):
-                st.json(record)
+    st.subheader("Search History")
+    if st.session_state.search_history:
+        for idx, record in enumerate(reversed(st.session_state.search_history)):
+            with st.expander(f"Search #{len(st.session_state.search_history)-idx} - @{record['username']} - {record['timestamp']}"):
+                st.write(f"Total comments: {record['total_comments']}")
+                st.write(f"Posts scanned: {record['posts_scanned']}")
+                if record['results']:
+                    sample = record['results'][:3]
+                    for r in sample:
+                        st.write(f"- {r['comment']} ({r['post_url']})")
+                    if len(record['results']) > 3:
+                        st.write(f"... and {len(record['results'])-3} more")
+                else:
+                    st.write("No comments found.")
     else:
-        st.info("No scans performed yet.")
+        st.info("No search history yet.")
 
 with tab3:
-    st.subheader("Exfiltration Buffer")
-    if st.session_state.exfil_buffer:
-        for item in reversed(st.session_state.exfil_buffer):
-            with st.expander(f"{item['type']} - {item.get('timestamp', '')}"):
-                st.json(item.get("data", {}))
-        if st.button("Clear Buffer"):
-            st.session_state.exfil_buffer = []
-            st.success("Buffer cleared")
-    else:
-        st.info("No exfil data collected.")
+    st.subheader("How it works")
+    st.markdown("""
+    1. **Search for posts**: The tool uses a search engine (DuckDuckGo or Google) to find Instagram posts that might contain comments from the target user.
+    2. **Extract comments**: For each found post, it fetches the comments (up to the limit) using Instagram's public API.
+    3. **Filter**: It filters comments to keep only those made by the specified username.
+    4. **Present results**: Results are displayed in a table and as comment cards, with links to the original posts.
+    
+    **Important Notes**:
+    - The search engine may not find all posts where the user commented; results depend on search engine indexing.
+    - Instagram may rate-limit requests; use responsibly.
+    - Some posts may be private or not accessible; those will be skipped.
+    - The tool does not require login, but some endpoints may need a CSRF token (automatically handled).
+    """)
+    
+    st.subheader("Installation Requirements")
+    st.code("""
+    pip install streamlit requests pandas googlesearch-python
+    """, language="bash")
+    st.caption("If Google search is not installed, the tool will fallback to DuckDuckGo.")
 
+# تذييل
 st.divider()
-st.caption("🔍 Instagram Vulnerability Scanner | For authorized security assessment only")
+st.caption("💬 Instagram Comment Extractor | For educational and authorized use only")
