@@ -1,67 +1,54 @@
-import streamlit as st
-import random
-import time
+import sys
+import itertools
 
-st.set_page_config(page_title="Instagram Heuristic Auditor", layout="centered")
-
-st.title("🛡️ Autonomous Heuristic Credential Auditor")
-st.write("Target intelligence and automated permutation engine.")
-
-# Input controls
-target_user = st.text_input("Target Username", value="rrenguk")
-batch_size = st.slider("Batch Generation Size", min_value=10, max_value=100, value=30)
-
-def generate_heuristic_batch(target, size):
-    t = target.lower()
-    suffixes = ["123", "2006", "2005", "1999", "777", "007", "!", "_", "11", "99"]
-    prefixes = ["mr_", "the_", "x_", "real", "i_am_"]
-    substitutions = {'a': '@', 'i': '1', 'e': '3', 'o': '0', 's': '$'}
+def generate_targeted_wordlist(output_file="target_wordlist.txt"):
+    # Target Intelligence Seeds
+    first_names = ["adian", "adyan"]
+    last_names = ["alboherb", "alborebh"]
+    dates = ["24", "02", "2006", "06", "2402", "24022006", "240206", "feb24", "24feb"]
+    separators = ["", ".", "_", "-"]
     
-    batch = []
-    for _ in range(size):
-        ptype = random.choice([1, 2, 3, 4, 5])
-        if ptype == 1:
-            pwd = f"{t}{random.choice(suffixes)}"
-        elif ptype == 2:
-            pwd = "".join(substitutions.get(c, c) for c in t) + random.choice(suffixes)
-        elif ptype == 3:
-            pwd = f"{random.choice(prefixes)}{t}"
-        elif ptype == 4:
-            pwd = f"{t}{t[-1]*2}{random.randint(10,99)}"
-        else:
-            pwd = f"{t}.{random.randint(100,999)}"
-        batch.append(pwd)
-    return list(set(batch))
+    wordlist = set()
+    
+    # Base combinations (First + Last, Last + First, Emails)
+    for f in first_names:
+        for l in last_names:
+            for sep in separators:
+                wordlist.add(f"{f}{sep}{l}")
+                wordlist.add(f"{l}{sep}{f}")
+                wordlist.add(f"{f}{sep}{l[0]}")
+                wordlist.add(f"{f[0]}{sep}{l}")
+                
+    # Add birthdate permutations
+    base_bases = list(wordlist) + first_names + last_names + ["adian.alborebh", "adian_alborebh"]
+    
+    for base in base_bases:
+        for d in dates:
+            for sep in separators:
+                wordlist.add(f"{base}{sep}{d}")
+                wordlist.add(f"{d}{sep}{base}")
 
-if st.button("Initialize Heuristic Scan"):
-    if not target_user:
-        st.error("Provide a target username first.")
-    else:
-        st.success(f"Target locked: {target_user}. Running simulation loops...")
-        
-        status_container = st.empty()
-        progress_bar = st.progress(0)
-        
-        # Safe non-blocking iteration loop for Streamlit
-        total_iterations = 5
-        found = False
-        
-        for iteration in range(1, total_iterations + 1):
-            passwords = generate_heuristic_batch(target_user, batch_size)
-            
-            for idx, pwd in enumerate(passwords):
-                status_container.text(f"[Iteration {iteration}/{total_iterations}] Testing heuristic permutation: {pwd}")
-                time.sleep(0.05) # Simulated request latency buffer
-            
-            progress_bar.progress(iteration / total_iterations)
-            
-            # Simulated match check (placeholder logic)
-            if iteration == total_iterations and random.random() > 0.8:
-                found = True
-                break
+    # Capitalization variations (Title case, UPPER, lower)
+    final_passwords = set()
+    for pwd in wordlist:
+        final_passwords.add(pwd.lower())
+        final_passwords.add(pwd.capitalize())
+        final_passwords.add(pwd.upper())
+        # Capitalize both parts if separated
+        for sep in ['.', '_', '-']:
+            if sep in pwd:
+                parts = pwd.split(sep)
+                final_passwords.add(sep.join([p.capitalize() for p in parts]))
 
-        if found:
-            st.success(f"[!] Target match verified successfully!")
-        else:
-            st.info("[-] Scan batch complete. No valid authentication handshake caught in this sequence. Adjust parameters and re-run.")
+    # Write out to file
+    with open(output_file, "w", encoding="utf-8") as f:
+        for pwd in sorted(final_passwords):
+            f.write(pwd + "\n")
+            
+    print(f"[+] Targeted intelligence wordlist compiled successfully.")
+    print(f"[+] Total unique permutations generated: {len(final_passwords)}")
+    print(f"[+] Output saved to: {output_file}")
 
+if __name__ == "__main__":
+    outfile = sys.argv[1] if len(sys.argv) > 1 else "adian_wordlist.txt"
+    generate_targeted_wordlist(outfile)
