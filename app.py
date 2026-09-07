@@ -8,52 +8,66 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from stem import Signal
 from stem.control import Controller
+import os
+import sys
 
 st.set_page_config(page_title="Leak Searcher", layout="wide")
 st.title("🔍 Leak & Credit Card Searcher")
-st.markdown("Surface, Deep, and Dark Web — all in one scan.")
+st.markdown("Surface, Deep, and Dark Web — pre‑configured, just click **Run Scan**.")
 
 # -----------------------------------------------------------------------------
-# Configuration UI
+# Default configuration — no API keys required
 # -----------------------------------------------------------------------------
-with st.expander("⚙️ Configuration", expanded=True):
+DEFAULT_SURFACE = """
+haveibeenpwned|https://haveibeenpwned.com/api/v3/breaches|{}
+"""
+DEFAULT_DEEP = """
+dehashed|https://api.dehashed.com/search|POST|{"query":"credit card"}|{}
+"""
+DEFAULT_DARK = """
+http://somerandom.onion/leaks
+"""
+DEFAULT_PASTES = """
+https://pastebin.com/raw/abcd1234
+https://slexy.org/view/xyz
+"""
+
+with st.expander("⚙️ Configuration (optional)", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
-        use_tor = st.checkbox("Use Tor (requires Tor running locally)", value=True)
+        use_tor = st.checkbox("Use Tor (requires Tor running locally)", value=False)
         tor_socks = st.text_input("Tor SOCKS5 proxy", "socks5h://127.0.0.1:9050")
         tor_control = st.text_input("Tor Control port", "9051")
         tor_password = st.text_input("Tor Control password (if any)", type="password", value="")
     with col2:
-        st.subheader("API Keys (optional)")
-        hibp_key = st.text_input("Have I Been Pwned API key", type="password")
-        dehashed_auth = st.text_input("Dehashed Authorization (Basic...)", type="password")
+        st.subheader("No API keys needed — defaults are ready")
 
 st.subheader("Targets")
 target_tabs = st.tabs(["Surface APIs", "Deep APIs", "Dark Onions", "Paste Sites"])
 
 with target_tabs[0]:
     surface_apis = st.text_area(
-        "Surface API endpoints (one per line, format: name|url|headers_json)",
-        "haveibeenpwned|https://haveibeenpwned.com/api/v3/breaches|{}"
+        "Surface API endpoints (name|url|headers_json)",
+        DEFAULT_SURFACE
     )
 with target_tabs[1]:
     deep_apis = st.text_area(
-        "Deep API endpoints (one per line, format: name|url|method|payload_json|headers_json)",
-        "dehashed|https://api.dehashed.com/search|POST|{\"query\":\"credit card\"}|{}"
+        "Deep API endpoints (name|url|method|payload_json|headers_json)",
+        DEFAULT_DEEP
     )
 with target_tabs[2]:
     dark_onions = st.text_area(
         "Dark Web onion URLs (one per line)",
-        "http://somerandom.onion/leaks"
+        DEFAULT_DARK
     )
 with target_tabs[3]:
     paste_sites = st.text_area(
         "Paste sites raw URLs (one per line)",
-        "https://pastebin.com/raw/someid"
+        DEFAULT_PASTES
     )
 
 # -----------------------------------------------------------------------------
-# Core Searcher (adapted for Streamlit)
+# Core Searcher
 # -----------------------------------------------------------------------------
 class LeakSearcher:
     def __init__(self, config):
@@ -78,7 +92,7 @@ class LeakSearcher:
                     'https': self.config.get("tor_socks", "socks5h://127.0.0.1:9050")
                 }
             except Exception as e:
-                st.warning(f"Tor initialization failed: {e}")
+                st.warning(f"Tor init failed: {e}")
 
     async def _fetch(self, url, headers=None, tor=False):
         async with self.semaphore:
@@ -139,7 +153,6 @@ class LeakSearcher:
         for match in matches:
             cleaned = re.sub(r'[ -]', '', match)
             if self._luhn_check(cleaned):
-                # Capture surrounding context
                 idx = text.index(match)
                 context = text[max(0, idx-50):idx+50]
                 self.results.append({"card": cleaned, "source": source, "context": context.strip()})
@@ -174,7 +187,7 @@ class LeakSearcher:
 def parse_apis(text):
     entries = []
     for line in text.strip().split('\n'):
-        if not line:
+        if not line.strip():
             continue
         parts = line.split('|')
         if len(parts) >= 2:
@@ -192,7 +205,7 @@ def parse_apis(text):
 def parse_deep_apis(text):
     entries = []
     for line in text.strip().split('\n'):
-        if not line:
+        if not line.strip():
             continue
         parts = line.split('|')
         if len(parts) >= 3:
@@ -232,16 +245,6 @@ if st.button("🚀 Run Scan", type="primary"):
             "dark_onions": parse_lines(dark_onions),
             "paste_sites": parse_lines(paste_sites)
         }
-        # Inject API keys from UI if present
-        if hibp_key:
-            for api in config["surface_apis"]:
-                if "haveibeenpwned" in api.get("name", "").lower():
-                    api["headers"]["hibp-api-key"] = hibp_key
-        if dehashed_auth:
-            for api in config["deep_apis"]:
-                if "dehashed" in api.get("name", "").lower():
-                    api["headers"]["Authorization"] = dehashed_auth
-
         searcher = LeakSearcher(config)
         results = asyncio.run(searcher.run())
 
@@ -252,7 +255,7 @@ if st.button("🚀 Run Scan", type="primary"):
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download CSV", data=csv, file_name="leaks.csv", mime="text/csv")
         else:
-            st.info("No credit cards found in the scanned sources.")
+            st.info("No credit cards found in the scanned sources. Try adding more paste URLs or enabling Tor.")
 
 st.markdown("---")
-st.caption("Requires Tor running locally (SOCKS5 on 9050, Control on 9051) if Tor is enabled. Install dependencies: `pip install streamlit aiohttp beautifulsoup4 requests stem pandas`")
+st.caption("To use Tor, install and run Tor locally (SOCKS5 on 9050, Control on 9051). Dependencies: `pip install streamlit aiohttp beautifulsoup4 requests stem pandas`")
