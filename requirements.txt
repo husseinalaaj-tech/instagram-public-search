@@ -1,7 +1,1 @@
 streamlit>=1.28.0
-requests>=2.31.0
-cryptography>=41.0.0
-keyboard>=0.13.5
-pywin32>=306; sys_platform == 'win32'
-pypiwin32>=223; sys_platform == 'win32'
-sqlite3
