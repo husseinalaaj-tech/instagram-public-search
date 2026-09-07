@@ -1,5 +1,6 @@
-playwright
 streamlit
+aiohttp
+beautifulsoup4
+requests
+stem
 pandas
-asyncio
-dnspython
