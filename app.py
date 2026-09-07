@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# منارة نونو - وحدة التحكم المركزية
+# منارة نونو - وحدة التحكم المركزية (النسخة المُصلحة)
 # streamlit run app.py
 
 import streamlit as st
@@ -8,6 +8,7 @@ import os
 import json
 import time
 import re
+import sys
 from datetime import datetime
 import pandas as pd
 import plotly.express as px
@@ -34,21 +35,25 @@ st.markdown("""
         border: 1px solid #ff6600;
         border-radius: 0px;
         width: 100%;
+        padding: 10px;
     }
     .stButton > button:hover {
         background: #ff6600;
         color: #000;
+        border-color: #ff6600;
     }
-    .css-1d391kg { background-color: #111; }
     .stTextInput > div > div > input {
         background-color: #1a1a1a;
         color: #ffcc00;
         border: 1px solid #333;
+        padding: 8px;
+        border-radius: 4px;
     }
     .stTextArea > div > div > textarea {
         background-color: #1a1a1a;
         color: #ffcc00;
         border: 1px solid #333;
+        border-radius: 4px;
     }
     .stSelectbox > div > div > select {
         background-color: #1a1a1a;
@@ -66,13 +71,42 @@ st.markdown("""
         color: #ffcc00;
         font-family: 'Courier New', monospace;
         white-space: pre-wrap;
-        max-height: 400px;
+        max-height: 500px;
         overflow-y: auto;
+        font-size: 13px;
+        line-height: 1.5;
     }
-    .success { color: #00ff00; }
-    .warning { color: #ffcc00; }
-    .danger { color: #ff0000; }
-    .info { color: #00ccff; }
+    .stAlert {
+        background-color: #1a1a1a;
+        border-color: #ff6600;
+    }
+    .stInfo {
+        background-color: #0d1a2b;
+        border-color: #00ccff;
+    }
+    .css-1d391kg { background-color: #111; }
+    
+    /* تنسيق الشريط الجانبي */
+    .css-1aumxhk {
+        background-color: #0d0d0d;
+        border-right: 1px solid #333;
+    }
+    
+    /* تنسيق الأزرار في الشريط الجانبي */
+    .css-1aumxhk .stButton button {
+        background: transparent;
+        border: none;
+        color: #ffcc00;
+        text-align: left;
+        padding: 8px 12px;
+        border-radius: 4px;
+        font-size: 14px;
+    }
+    
+    .css-1aumxhk .stButton button:hover {
+        background: #1a1a1a;
+        color: #ff6600;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,6 +119,14 @@ if 'results' not in st.session_state:
     st.session_state.results = []
 if 'current_tool' not in st.session_state:
     st.session_state.current_tool = "WiFi Attack"
+if 'logs' not in st.session_state:
+    st.session_state.logs = []
+
+def add_log(message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{timestamp}] {message}")
+    if len(st.session_state.logs) > 100:
+        st.session_state.logs = st.session_state.logs[-100:]
 
 # ============================================================
 # الشريط الجانبي
@@ -122,8 +164,19 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### 📊 حالة النظام")
-    st.info("🔵 النظام جاهز")
-    st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    status_col1, status_col2 = st.columns(2)
+    with status_col1:
+        st.info("🔵 جاهز")
+    with status_col2:
+        st.caption(f"{datetime.now().strftime('%H:%M')}")
+    
+    st.markdown("---")
+    st.markdown("### 📋 السجل")
+    log_area = st.empty()
+    if st.session_state.logs:
+        last_logs = st.session_state.logs[-5:]
+        log_area.text_area("", "\n".join(last_logs), height=100, disabled=True)
     
     st.markdown("---")
     st.markdown("made by @cheifbreef on discord :)")
@@ -143,6 +196,8 @@ INTERFACE="{params.get('interface', 'wlan0')}"
 BSSID="{params.get('bssid', 'XX:XX:XX:XX:XX:XX')}"
 CHANNEL="{params.get('channel', '6')}"
 NAME="target_$(date +%s)"
+
+echo "🔥 بدء الهجوم على $BSSID"
 
 # قتل العمليات المتعارضة
 sudo airmon-ng check kill
@@ -178,6 +233,8 @@ WORKDIR="zain_$(date +%s)"
 mkdir $WORKDIR
 cd $WORKDIR
 
+echo "🔥 بدء الهجوم على $TARGET"
+
 # 1. جمع المعلومات
 echo "📡 جمع المعلومات عن $TARGET..."
 sherlock $TARGET > osint_data.txt
@@ -210,6 +267,8 @@ USERNAME="{params.get('username', 'target_user')}"
 WORKDIR="insta_$(date +%s)"
 mkdir $WORKDIR
 cd $WORKDIR
+
+echo "🔥 بدء الهجوم على $USERNAME"
 
 # 1. جمع المعلومات
 echo "📡 جمع المعلومات..."
@@ -272,6 +331,8 @@ WORKDIR="fb_$(date +%s)"
 mkdir $WORKDIR
 cd $WORKDIR
 
+echo "🔥 بدء الهجوم على $EMAIL"
+
 # 1. جمع المعلومات
 echo "📡 جمع المعلومات..."
 sherlock $EMAIL > osint.txt
@@ -331,6 +392,8 @@ OUTPUT="osint_$(date +%s)"
 mkdir $OUTPUT
 cd $OUTPUT
 
+echo "🔥 بدء جمع المعلومات عن $TARGET"
+
 # 1. البحث الأساسي
 echo "🔍 البحث عن $TARGET..."
 sherlock $TARGET > sherlock.txt
@@ -349,7 +412,7 @@ twint -u $TARGET --timeline --limit 100 > twitter.txt 2>/dev/null
 curl -s "https://api.github.com/search/users?q=$TARGET" > github.json
 
 # 6. البحث في الصور (البصمة الرقمية)
-exiftool *.{jpg,png,jpeg} 2>/dev/null > exif.txt
+exiftool *.{{jpg,png,jpeg}} 2>/dev/null > exif.txt
 
 # 7. جمع الروابط
 grep -rE "https?://[a-zA-Z0-9./?=_-]*" . | sort -u > links.txt
@@ -383,7 +446,7 @@ if selected_tool == "🏴 WiFi Attack":
         wordlist = st.text_input("مسار قائمة الكلمات:", "/usr/share/wordlists/rockyou.txt")
         deauth_count = st.number_input("عدد حزم إلغاء المصادقة:", min_value=1, max_value=100, value=10)
     
-    if st.button("🔥 توليد كود هجوم WiFi"):
+    if st.button("🔥 توليد كود هجوم WiFi", use_container_width=True):
         params = {
             'interface': interface,
             'bssid': bssid,
@@ -393,6 +456,7 @@ if selected_tool == "🏴 WiFi Attack":
         }
         st.session_state.generated_code = generate_code("WiFi Attack", params)
         st.session_state.current_tool = "WiFi Attack"
+        add_log(f"توليد كود WiFi Attack - {bssid}")
 
 elif selected_tool == "📱 Zain/Asiacel":
     st.markdown("## 📱 هجوم زين واسياسيل")
@@ -406,7 +470,7 @@ elif selected_tool == "📱 Zain/Asiacel":
         custom_words = st.text_area("كلمات مخصصة (كل كلمة في سطر):", "بغداد\nالعراق\nزين\nاسياسيل\nعراقي")
         threads = st.number_input("عدد الخيوط:", min_value=1, max_value=10, value=4)
     
-    if st.button("🔥 توليد كود هجوم زين"):
+    if st.button("🔥 توليد كود هجوم زين", use_container_width=True):
         words_list = [w.strip() for w in custom_words.split('\n') if w.strip()]
         params = {
             'target_number': target_number,
@@ -416,6 +480,7 @@ elif selected_tool == "📱 Zain/Asiacel":
         }
         st.session_state.generated_code = generate_code("Zain/Asiacel", params)
         st.session_state.current_tool = "Zain/Asiacel"
+        add_log(f"توليد كود Zain/Asiacel - {target_number}")
 
 elif selected_tool == "📸 Instagram":
     st.markdown("## 📸 هجوم إنستغرام")
@@ -428,7 +493,7 @@ elif selected_tool == "📸 Instagram":
     with col2:
         delay = st.number_input("تأخير بين المحاولات (ثواني):", min_value=10, max_value=3600, value=300)
     
-    if st.button("🔥 توليد كود هجوم إنستغرام"):
+    if st.button("🔥 توليد كود هجوم إنستغرام", use_container_width=True):
         params = {
             'username': username,
             'threads': str(threads),
@@ -436,6 +501,7 @@ elif selected_tool == "📸 Instagram":
         }
         st.session_state.generated_code = generate_code("Instagram", params)
         st.session_state.current_tool = "Instagram"
+        add_log(f"توليد كود Instagram - {username}")
 
 elif selected_tool == "👤 Facebook":
     st.markdown("## 👤 هجوم فيسبوك")
@@ -449,7 +515,7 @@ elif selected_tool == "👤 Facebook":
         last_name = st.text_input("اسم العائلة:", "user")
         threads = st.number_input("عدد الخيوط:", min_value=1, max_value=10, value=2)
     
-    if st.button("🔥 توليد كود هجوم فيسبوك"):
+    if st.button("🔥 توليد كود هجوم فيسبوك", use_container_width=True):
         params = {
             'email': email,
             'first_name': first_name,
@@ -459,24 +525,27 @@ elif selected_tool == "👤 Facebook":
         }
         st.session_state.generated_code = generate_code("Facebook", params)
         st.session_state.current_tool = "Facebook"
+        add_log(f"توليد كود Facebook - {email}")
 
 elif selected_tool == "🔍 OSINT":
     st.markdown("## 🔍 جمع المعلومات الاستخباراتية")
     target = st.text_input("الهدف (اسم مستخدم/بريد/مجال):", "target")
     
-    if st.button("🔥 توليد كود OSINT"):
+    if st.button("🔥 توليد كود OSINT", use_container_width=True):
         params = {'target': target}
         st.session_state.generated_code = generate_code("OSINT", params)
         st.session_state.current_tool = "OSINT"
+        add_log(f"توليد كود OSINT - {target}")
 
 elif selected_tool == "⚡ Custom Payload":
     st.markdown("## ⚡ حمولة مخصصة")
     custom_code = st.text_area("أدخل الكود المخصص:", height=300, placeholder="اكتب أي كود هنا...")
     
-    if st.button("🔥 حفظ الحمولة"):
+    if st.button("🔥 حفظ الحمولة", use_container_width=True):
         params = {'custom_code': custom_code}
         st.session_state.generated_code = generate_code("Custom Payload", params)
         st.session_state.current_tool = "Custom Payload"
+        add_log("توليد كود مخصص")
 
 # ============================================================
 # عرض الكود المولد
@@ -492,9 +561,8 @@ if st.session_state.generated_code:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("📋 نسخ الكود"):
+        if st.button("📋 نسخ الكود", use_container_width=True):
             st.write("✅ تم النسخ إلى الحافظة")
-            # استخدام JavaScript للنسخ
             st.markdown(f'''
             <script>
                 navigator.clipboard.writeText(`{st.session_state.generated_code}`);
@@ -502,23 +570,24 @@ if st.session_state.generated_code:
             ''', unsafe_allow_html=True)
     
     with col2:
-        if st.button("💾 حفظ كملف"):
-            filename = f"{st.session_state.current_tool.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sh"
-            st.download_button(
-                label="⬇️ تحميل الملف",
-                data=st.session_state.generated_code,
-                file_name=filename,
-                mime="text/plain"
-            )
+        filename = f"{st.session_state.current_tool.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sh"
+        st.download_button(
+            label="⬇️ تحميل الملف",
+            data=st.session_state.generated_code,
+            file_name=filename,
+            mime="text/plain",
+            use_container_width=True
+        )
     
     with col3:
-        if st.button("🚀 تنفيذ (محاكاة)"):
+        if st.button("🚀 تنفيذ (محاكاة)", use_container_width=True):
             st.info("⚡ تنفيذ محاكى... (في البيئة الحقيقية، سيتم تشغيل الكود)")
             st.session_state.results.append({
-                'time': datetime.now(),
-                'tool': st.session_state.current_tool,
-                'status': 'محاكاة'
+                'الوقت': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'الأداة': st.session_state.current_tool,
+                'الحالة': 'محاكاة'
             })
+            add_log(f"تنفيذ محاكاة - {st.session_state.current_tool}")
 else:
     st.warning("⚠️ قم بتوليد كود أولاً باستخدام الأزرار أعلاه")
 
@@ -530,12 +599,21 @@ st.markdown("## 📊 سجل العمليات")
 
 if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)
-    st.dataframe(df)
+    st.dataframe(df, use_container_width=True)
     
     # رسم بياني بسيط
     if len(st.session_state.results) > 1:
-        fig = px.bar(df, x='tool', title='عدد العمليات حسب النوع')
-        st.plotly_chart(fig, use_container_width=True)
+        try:
+            fig = px.bar(df, x='الأداة', title='عدد العمليات حسب النوع')
+            fig.update_layout(
+                plot_bgcolor='#0a0a0a',
+                paper_bgcolor='#0a0a0a',
+                font_color='#ffcc00'
+            )
+            fig.update_traces(marker_color='#ff6600')
+            st.plotly_chart(fig, use_container_width=True)
+        except:
+            pass
 else:
     st.info("لا توجد عمليات مسجلة بعد")
 
