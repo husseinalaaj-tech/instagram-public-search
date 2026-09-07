@@ -9,7 +9,6 @@ import threading
 import queue
 import re
 from datetime import datetime
-from flask import Flask, request, redirect
 
 st.set_page_config(page_title="Authentication Crawler v3.5 Pro", layout="wide")
 
@@ -341,6 +340,13 @@ async def run_session_reuse(username, stop_event, log_q, prog_q, res_q):
     log_q.put(("INFO", "Session reuse: no valid tokens found."))
 
 async def run_phishing_server(username, stop_event, log_q, prog_q, res_q):
+    try:
+        from flask import Flask, request, redirect
+    except ImportError:
+        log_q.put(("WARN", "Flask not installed. Phishing server skipped."))
+        prog_q.put(("Phishing", 100.0, 0.05, 0))
+        return
+
     log_q.put(("INFO", "Starting phishing server on port 8080 (demo)."))
     app = Flask("phish")
 
@@ -550,14 +556,11 @@ if st.session_state.worker_queues:
         except queue.Empty:
             break
 
-    progress_updates = {}
-    total_weight = 0.0
     while not prog_q.empty():
         try:
             method, p, w, attempts = prog_q.get_nowait()
             st.session_state.progress_dict[method] = p
             st.session_state.total_attempts += attempts
-            progress_updates[method] = (p, w)
         except queue.Empty:
             break
 
