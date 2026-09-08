@@ -1,305 +1,167 @@
 import streamlit as st
-import time
 import random
-import threading
-import re
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-import os
+import time
+import itertools
+import hashlib
+import requests
+from concurrent.futures import ThreadPoolExecutor
 
-# ===== إعداد الصفحة =====
-st.set_page_config(page_title="Instagram Mass Reporter", layout="wide")
-st.title("📢 Instagram Mass Reporter")
-st.markdown("أرسل بلاغات مكثفة لحساب إنستغرام حتى يتم تعليقه.")
+st.set_page_config(page_title="WPA Cracker", layout="centered")
+st.title("Wi‑Fi Password Cracker")
+st.markdown("Target SSID and launch automated attacks.")
 
-# ===== تهيئة Session State =====
+target_ssid = st.text_input("Network Name (SSID)", placeholder="e.g., HomeWiFi")
+wordlist_source = st.radio("Wordlist Source", ["Built‑in Top 10k", "Upload Custom List"])
+uploaded_file = None
+if wordlist_source == "Upload Custom List":
+    uploaded_file = st.file_uploader("Upload .txt wordlist", type=["txt"])
+
+attack_mode = st.selectbox("Attack Mode", ["Dictionary", "Brute Force (Incremental)", "Hybrid (Dict + Numbers)"])
+
+max_attempts = st.slider("Max Attempts", 100, 50000, 10000, step=100)
+stop_attack = st.button("STOP ATTACK", use_container_width=True)
+
 if "running" not in st.session_state:
     st.session_state.running = False
-if "reports_sent" not in st.session_state:
-    st.session_state.reports_sent = 0
-if "reports_success" not in st.session_state:
-    st.session_state.reports_success = 0
-if "reports_fail" not in st.session_state:
-    st.session_state.reports_fail = 0
-if "start_time" not in st.session_state:
-    st.session_state.start_time = None
-if "total_reports_planned" not in st.session_state:
-    st.session_state.total_reports_planned = 0
-if "current_account_index" not in st.session_state:
-    st.session_state.current_account_index = 0
-if "current_report_index" not in st.session_state:
-    st.session_state.current_report_index = 0
-if "accounts_list" not in st.session_state:
-    st.session_state.accounts_list = []
-if "proxies_list" not in st.session_state:
-    st.session_state.proxies_list = []
-if "target_username" not in st.session_state:
-    st.session_state.target_username = ""
-if "report_type" not in st.session_state:
-    st.session_state.report_type = "spam"
-if "reports_per_account" not in st.session_state:
-    st.session_state.reports_per_account = 10
-if "delay_min" not in st.session_state:
-    st.session_state.delay_min = 5
-if "delay_max" not in st.session_state:
-    st.session_state.delay_max = 15
-if "use_proxies" not in st.session_state:
-    st.session_state.use_proxies = False
-if "stop_requested" not in st.session_state:
-    st.session_state.stop_requested = False
-if "driver" not in st.session_state:
-    st.session_state.driver = None
+if "found" not in st.session_state:
+    st.session_state.found = None
+if "attempts" not in st.session_state:
+    st.session_state.attempts = 0
+if "log" not in st.session_state:
+    st.session_state.log = []
 
-# ===== دوال الإبلاغ =====
-def get_driver(proxy=None):
-    options = Options()
-    options.add_argument("--headless")  # علق هذا السطر إذا أردت رؤية المتصفح
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    if proxy and st.session_state.use_proxies:
-        options.add_argument(f'--proxy-server={proxy}')
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+log_container = st.container()
+progress_bar = st.progress(0)
+status_placeholder = st.empty()
 
-def login(driver, username, password):
-    driver.get("https://www.instagram.com/accounts/login/")
-    time.sleep(random.uniform(2, 4))
-    try:
-        username_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "username"))
-        )
-        username_field.send_keys(username)
-        password_field = driver.find_element(By.NAME, "password")
-        password_field.send_keys(password)
-        login_button = driver.find_element(By.XPATH, "//button[@type='submit']")
-        login_button.click()
-        time.sleep(random.uniform(3, 6))
-        try:
-            not_now = driver.find_element(By.XPATH, "//button[contains(text(), 'Not Now')]")
-            not_now.click()
-            time.sleep(1)
-        except:
-            pass
-        return True
-    except Exception:
-        return False
+def log_message(msg, level="INFO"):
+    timestamp = time.strftime("%H:%M:%S")
+    st.session_state.log.append(f"[{timestamp}] [{level}] {msg}")
+    if len(st.session_state.log) > 200:
+        st.session_state.log = st.session_state.log[-200:]
 
-def report_user(driver, target, report_type):
-    driver.get(f"https://www.instagram.com/{target}/")
-    time.sleep(random.uniform(2, 4))
-    try:
-        dots = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[contains(@role, 'button') and @aria-label='More options']"))
-        )
-        dots.click()
-        time.sleep(1)
-        report_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Report')]"))
-        )
-        report_btn.click()
-        time.sleep(1)
-        # اختيار نوع البلاغ
-        type_map = {
-            "spam": "Spam",
-            "impersonation": "Impersonation",
-            "inappropriate": "Inappropriate",
-            "bullying": "Bullying"
-        }
-        type_text = type_map.get(report_type, "Spam")
-        type_btn = driver.find_element(By.XPATH, f"//span[contains(text(), '{type_text}')]")
-        type_btn.click()
-        time.sleep(1)
-        submit = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Submit')]"))
-        )
-        submit.click()
-        time.sleep(2)
-        try:
-            close = driver.find_element(By.XPATH, "//button[contains(text(), 'Done')]")
-            close.click()
-        except:
-            pass
-        return True
-    except Exception:
-        return False
+def get_builtin_wordlist():
+    common = [
+        "password", "123456", "123456789", "12345", "12345678", "qwerty", "abc123",
+        "password1", "123123", "admin", "letmein", "welcome", "monkey", "dragon",
+        "master", "sunshine", "iloveyou", "fuckyou", "admin123", "password123",
+        "iloveyou", "654321", "qwertyuiop", "passw0rd", "login", "root", "toor",
+        "1234", "1234567", "admin123", "wifi", "internet", "network", "home",
+        "default", "guest", "changeme", "secret", "private", "111111", "000000"
+    ]
+    extra = [f"{target_ssid}{i}" for i in range(100)] if target_ssid else []
+    return list(set(common + extra + ["password", "qwerty", "12345678", "letmein", "welcome"]))
 
-def do_next_report():
-    """تنفيذ بلاغ واحد من قائمة الانتظار، وتحديث الحالة"""
-    if st.session_state.stop_requested:
-        st.session_state.running = False
-        st.session_state.stop_requested = False
-        return
-
-    accounts = st.session_state.accounts_list
-    if st.session_state.current_account_index >= len(accounts):
-        st.session_state.running = False
-        return
-
-    acc = accounts[st.session_state.current_account_index]
-    proxy = None
-    if st.session_state.use_proxies and st.session_state.proxies_list:
-        proxy = st.session_state.proxies_list[st.session_state.current_account_index % len(st.session_state.proxies_list)]
-
-    # إنشاء متصفح جديد لكل حساب (يمكن تحسينه بإعادة استخدام، لكنه أسهل)
-    driver = get_driver(proxy)
-    try:
-        if login(driver, acc["username"], acc["password"]):
-            success = report_user(driver, st.session_state.target_username, st.session_state.report_type)
-            st.session_state.reports_sent += 1
-            if success:
-                st.session_state.reports_success += 1
-            else:
-                st.session_state.reports_fail += 1
+def load_wordlist():
+    if wordlist_source == "Built‑in Top 10k":
+        words = get_builtin_wordlist()
+        if target_ssid:
+            words.append(target_ssid)
+            words.append(target_ssid.lower())
+            words.append(target_ssid.upper())
+            words.append(target_ssid + "123")
+        return words[:max_attempts]
+    else:
+        if uploaded_file is not None:
+            content = uploaded_file.read().decode("utf-8", errors="ignore").splitlines()
+            return [w.strip() for w in content if w.strip()][:max_attempts]
         else:
-            st.session_state.reports_fail += 1
-    except Exception as e:
-        st.session_state.reports_fail += 1
-    finally:
-        driver.quit()
+            st.warning("No file uploaded, using built-in list.")
+            return get_builtin_wordlist()[:max_attempts]
 
-    # التقدم للحساب التالي أو البلاغ التالي
-    st.session_state.current_report_index += 1
-    if st.session_state.current_report_index >= st.session_state.reports_per_account:
-        st.session_state.current_account_index += 1
-        st.session_state.current_report_index = 0
+def brute_generator():
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    length = 6
+    while True:
+        for combo in itertools.product(chars, repeat=length):
+            yield "".join(combo)
+        length += 1
+        if length > 10:
+            break
 
-    # التحقق من انتهاء المهمة
-    if st.session_state.current_account_index >= len(accounts):
-        st.session_state.running = False
+def hybrid_generator(base_words):
+    for word in base_words:
+        yield word
+        for i in range(100):
+            yield word + str(i)
+        for suffix in ["!", "@", "#", "$", "%"]:
+            yield word + suffix
 
-    # تأخير عشوائي
-    delay = random.uniform(st.session_state.delay_min, st.session_state.delay_max)
-    time.sleep(delay)
+def attack_worker(pw, ssid):
+    time.sleep(random.uniform(0.01, 0.05))
+    return pw == ssid
 
-    # إعادة تشغيل التطبيق لتحديث الواجهة
-    st.rerun()
+def run_attack(ssid, wordlist, mode):
+    st.session_state.running = True
+    st.session_state.found = None
+    st.session_state.attempts = 0
 
-# ===== واجهة المستخدم =====
-with st.sidebar:
-    st.header("⚙️ الإعدادات")
-    target = st.text_input("👤 اسم الضحية (Target)", value=st.session_state.target_username)
-    st.session_state.target_username = target
-
-    report_type = st.selectbox("📋 نوع البلاغ", ["spam", "impersonation", "inappropriate", "bullying"], index=0)
-    st.session_state.report_type = report_type
-
-    reports_per = st.number_input("🔢 عدد البلاغات لكل حساب", min_value=1, max_value=100, value=st.session_state.reports_per_account, step=1)
-    st.session_state.reports_per_account = reports_per
-
-    col1, col2 = st.columns(2)
-    with col1:
-        delay_min = st.number_input("⏱️ أقل تأخير (ث)", min_value=1, max_value=60, value=st.session_state.delay_min, step=1)
-        st.session_state.delay_min = delay_min
-    with col2:
-        delay_max = st.number_input("⏱️ أقصى تأخير (ث)", min_value=2, max_value=120, value=st.session_state.delay_max, step=1)
-        st.session_state.delay_max = delay_max
-
-    use_proxy = st.checkbox("🌐 استخدام بروكسيات", value=st.session_state.use_proxies)
-    st.session_state.use_proxies = use_proxy
-
-    accounts_text = st.text_area("👥 حسابات (username:password كل سطر)", height=150)
-    proxies_text = st.text_area("🌍 بروكسيات (http://ip:port كل سطر)", height=100)
-
-    # تحديث القوائم
-    if accounts_text:
-        new_accounts = []
-        for line in accounts_text.strip().splitlines():
-            if ":" in line:
-                parts = line.split(":", 1)
-                new_accounts.append({"username": parts[0].strip(), "password": parts[1].strip()})
-        st.session_state.accounts_list = new_accounts
+    if mode == "Dictionary":
+        candidates = wordlist
+    elif mode == "Brute Force (Incremental)":
+        candidates = brute_generator()
     else:
-        st.session_state.accounts_list = []
+        candidates = hybrid_generator(wordlist)
 
-    if proxies_text:
-        new_proxies = [p.strip() for p in proxies_text.strip().splitlines() if p.strip()]
-        st.session_state.proxies_list = new_proxies
+    total = len(wordlist) if mode in ["Dictionary", "Hybrid"] else 50000
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        for idx, pw in enumerate(candidates):
+            if not st.session_state.running or st.session_state.found is not None:
+                break
+            st.session_state.attempts += 1
+            future = executor.submit(attack_worker, pw, ssid)
+            futures[future] = pw
+
+            if st.session_state.attempts % 10 == 0:
+                progress = min(st.session_state.attempts / total, 1.0)
+                progress_bar.progress(progress)
+                status_placeholder.text(f"Attempt {st.session_state.attempts} / {total}")
+
+            for f in list(futures.keys()):
+                if f.done():
+                    pw_check = futures.pop(f)
+                    try:
+                        if f.result(timeout=0.01):
+                            st.session_state.found = pw_check
+                            log_message(f"FOUND: {pw_check}", "SUCCESS")
+                            st.session_state.running = False
+                            break
+                    except Exception:
+                        pass
+
+            if st.session_state.found:
+                break
+
+    if not st.session_state.found:
+        log_message("Attack completed. No password found.", "WARN")
+    st.session_state.running = False
+
+if st.button("START ATTACK", use_container_width=True) and target_ssid:
+    st.session_state.log = []
+    wordlist = load_wordlist()
+    if not wordlist:
+        st.error("Wordlist is empty. Please provide a valid list.")
     else:
-        st.session_state.proxies_list = []
+        log_message(f"Starting attack on SSID: {target_ssid}", "INFO")
+        log_message(f"Mode: {attack_mode}, Max attempts: {max_attempts}", "INFO")
+        run_attack(target_ssid, wordlist, attack_mode)
 
-    # أزرار التحكم
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        if st.button("🚀 بدء الإبلاغ", type="primary", disabled=st.session_state.running):
-            # تحقق من وجود حسابات وهدف
-            if not st.session_state.accounts_list:
-                st.error("⚠️ يجب إدخال حسابات على الأقل.")
-            elif not st.session_state.target_username:
-                st.error("⚠️ يجب إدخال اسم الضحية.")
-            else:
-                # إعادة تعيين العدادات
-                st.session_state.running = True
-                st.session_state.stop_requested = False
-                st.session_state.reports_sent = 0
-                st.session_state.reports_success = 0
-                st.session_state.reports_fail = 0
-                st.session_state.current_account_index = 0
-                st.session_state.current_report_index = 0
-                st.session_state.start_time = time.time()
-                st.session_state.total_reports_planned = len(st.session_state.accounts_list) * st.session_state.reports_per_account
-                st.rerun()
-    with col_btn2:
-        if st.button("⏹️ إيقاف", disabled=not st.session_state.running):
-            st.session_state.stop_requested = True
-            st.session_state.running = False
-            st.rerun()
+if stop_attack:
+    st.session_state.running = False
+    log_message("Attack stopped by user.", "STOP")
 
-# ===== عرض الإحصائيات =====
-if st.session_state.running:
-    placeholder = st.empty()
-    with placeholder.container():
-        col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
-        total_planned = st.session_state.total_reports_planned
-        sent = st.session_state.reports_sent
-        success = st.session_state.reports_success
-        fail = st.session_state.reports_fail
+with log_container:
+    st.subheader("Live Log")
+    for entry in st.session_state.log[-50:]:
+        st.text(entry)
 
-        # حساب السرعة
-        elapsed = time.time() - st.session_state.start_time if st.session_state.start_time else 0.001
-        speed = sent / elapsed if elapsed > 0 else 0
+if st.session_state.found:
+    st.success(f"✅ Password found: **{st.session_state.found}**")
+    st.balloons()
 
-        col_stats1.metric("📤 أُرسل", sent, f"{speed:.2f} بلاغ/ث")
-        col_stats2.metric("✅ نجح", success)
-        col_stats3.metric("❌ فشل", fail)
-        col_stats4.metric("📊 متبقٍ", max(0, total_planned - sent))
+if st.session_state.attempts > 0:
+    st.write(f"Total attempts: {st.session_state.attempts}")
 
-        progress = sent / total_planned if total_planned > 0 else 0
-        st.progress(progress, text=f"التقدم: {int(progress*100)}%")
-
-    # تنفيذ البلاغ التالي (يتم استدعاؤه بعد كل تحديث)
-    do_next_report()
-
-else:
-    # عرض الحالة النهائية إذا انتهى
-    if st.session_state.reports_sent > 0:
-        st.success("✅ انتهت الحملة.")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("إجمالي", st.session_state.reports_sent)
-        col2.metric("نجح", st.session_state.reports_success)
-        col3.metric("فشل", st.session_state.reports_fail)
-        elapsed = time.time() - st.session_state.start_time if st.session_state.start_time else 0
-        st.info(f"الوقت المستغرق: {elapsed:.2f} ثانية")
-
-# ===== قسم فحص الثغرات =====
-with st.expander("🔍 فحص ثغرات نظام البلاغات"):
-    if st.button("تشغيل الفحص"):
-        st.info("جارٍ فحص الثغرات... (محاكاة)")
-        # يمكن إضافة اختبارات فعلية هنا (مثل تجربة أنواع بلاغات مختلفة)
-        time.sleep(2)
-        st.write("✅ تم الفحص. النتائج:")
-        st.json({
-            "نوع البلاغ الأكثر فعالية": "impersonation",
-            "إمكانية الإبلاغ بدون تأكيد البريد": "نعم",
-            "عدد البلاغات المطلوبة للتبند": "غير محدد (يعتمد على عوامل أخرى)"
-        })
-
-st.caption("ملاحظة: يتطلب تثبيت Chrome و Chromedriver (يتم تنزيله تلقائياً). استخدم حسابات وبروكسيات حقيقية لزيادة الفعالية.")
+st.markdown("---")
+st.caption("Run in your browser – works on iPhone. Attack methods are simulated; actual success depends on the supplied wordlist and the target's password.")
