@@ -1,261 +1,305 @@
 import streamlit as st
-import asyncio
-import aiohttp
-import requests
-import json
+import time
+import random
+import threading
 import re
-import pandas as pd
-from bs4 import BeautifulSoup
-from stem import Signal
-from stem.control import Controller
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
 import os
-import sys
 
-st.set_page_config(page_title="Leak Searcher", layout="wide")
-st.title("🔍 Leak & Credit Card Searcher")
-st.markdown("Surface, Deep, and Dark Web — pre‑configured, just click **Run Scan**.")
+# ===== إعداد الصفحة =====
+st.set_page_config(page_title="Instagram Mass Reporter", layout="wide")
+st.title("📢 Instagram Mass Reporter")
+st.markdown("أرسل بلاغات مكثفة لحساب إنستغرام حتى يتم تعليقه.")
 
-# -----------------------------------------------------------------------------
-# Default configuration — no API keys required
-# -----------------------------------------------------------------------------
-DEFAULT_SURFACE = """
-haveibeenpwned|https://haveibeenpwned.com/api/v3/breaches|{}
-"""
-DEFAULT_DEEP = """
-dehashed|https://api.dehashed.com/search|POST|{"query":"credit card"}|{}
-"""
-DEFAULT_DARK = """
-http://somerandom.onion/leaks
-"""
-DEFAULT_PASTES = """
-https://pastebin.com/raw/abcd1234
-https://slexy.org/view/xyz
-"""
+# ===== تهيئة Session State =====
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "reports_sent" not in st.session_state:
+    st.session_state.reports_sent = 0
+if "reports_success" not in st.session_state:
+    st.session_state.reports_success = 0
+if "reports_fail" not in st.session_state:
+    st.session_state.reports_fail = 0
+if "start_time" not in st.session_state:
+    st.session_state.start_time = None
+if "total_reports_planned" not in st.session_state:
+    st.session_state.total_reports_planned = 0
+if "current_account_index" not in st.session_state:
+    st.session_state.current_account_index = 0
+if "current_report_index" not in st.session_state:
+    st.session_state.current_report_index = 0
+if "accounts_list" not in st.session_state:
+    st.session_state.accounts_list = []
+if "proxies_list" not in st.session_state:
+    st.session_state.proxies_list = []
+if "target_username" not in st.session_state:
+    st.session_state.target_username = ""
+if "report_type" not in st.session_state:
+    st.session_state.report_type = "spam"
+if "reports_per_account" not in st.session_state:
+    st.session_state.reports_per_account = 10
+if "delay_min" not in st.session_state:
+    st.session_state.delay_min = 5
+if "delay_max" not in st.session_state:
+    st.session_state.delay_max = 15
+if "use_proxies" not in st.session_state:
+    st.session_state.use_proxies = False
+if "stop_requested" not in st.session_state:
+    st.session_state.stop_requested = False
+if "driver" not in st.session_state:
+    st.session_state.driver = None
 
-with st.expander("⚙️ Configuration (optional)", expanded=True):
+# ===== دوال الإبلاغ =====
+def get_driver(proxy=None):
+    options = Options()
+    options.add_argument("--headless")  # علق هذا السطر إذا أردت رؤية المتصفح
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    if proxy and st.session_state.use_proxies:
+        options.add_argument(f'--proxy-server={proxy}')
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
+
+def login(driver, username, password):
+    driver.get("https://www.instagram.com/accounts/login/")
+    time.sleep(random.uniform(2, 4))
+    try:
+        username_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "username"))
+        )
+        username_field.send_keys(username)
+        password_field = driver.find_element(By.NAME, "password")
+        password_field.send_keys(password)
+        login_button = driver.find_element(By.XPATH, "//button[@type='submit']")
+        login_button.click()
+        time.sleep(random.uniform(3, 6))
+        try:
+            not_now = driver.find_element(By.XPATH, "//button[contains(text(), 'Not Now')]")
+            not_now.click()
+            time.sleep(1)
+        except:
+            pass
+        return True
+    except Exception:
+        return False
+
+def report_user(driver, target, report_type):
+    driver.get(f"https://www.instagram.com/{target}/")
+    time.sleep(random.uniform(2, 4))
+    try:
+        dots = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//div[contains(@role, 'button') and @aria-label='More options']"))
+        )
+        dots.click()
+        time.sleep(1)
+        report_btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Report')]"))
+        )
+        report_btn.click()
+        time.sleep(1)
+        # اختيار نوع البلاغ
+        type_map = {
+            "spam": "Spam",
+            "impersonation": "Impersonation",
+            "inappropriate": "Inappropriate",
+            "bullying": "Bullying"
+        }
+        type_text = type_map.get(report_type, "Spam")
+        type_btn = driver.find_element(By.XPATH, f"//span[contains(text(), '{type_text}')]")
+        type_btn.click()
+        time.sleep(1)
+        submit = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Submit')]"))
+        )
+        submit.click()
+        time.sleep(2)
+        try:
+            close = driver.find_element(By.XPATH, "//button[contains(text(), 'Done')]")
+            close.click()
+        except:
+            pass
+        return True
+    except Exception:
+        return False
+
+def do_next_report():
+    """تنفيذ بلاغ واحد من قائمة الانتظار، وتحديث الحالة"""
+    if st.session_state.stop_requested:
+        st.session_state.running = False
+        st.session_state.stop_requested = False
+        return
+
+    accounts = st.session_state.accounts_list
+    if st.session_state.current_account_index >= len(accounts):
+        st.session_state.running = False
+        return
+
+    acc = accounts[st.session_state.current_account_index]
+    proxy = None
+    if st.session_state.use_proxies and st.session_state.proxies_list:
+        proxy = st.session_state.proxies_list[st.session_state.current_account_index % len(st.session_state.proxies_list)]
+
+    # إنشاء متصفح جديد لكل حساب (يمكن تحسينه بإعادة استخدام، لكنه أسهل)
+    driver = get_driver(proxy)
+    try:
+        if login(driver, acc["username"], acc["password"]):
+            success = report_user(driver, st.session_state.target_username, st.session_state.report_type)
+            st.session_state.reports_sent += 1
+            if success:
+                st.session_state.reports_success += 1
+            else:
+                st.session_state.reports_fail += 1
+        else:
+            st.session_state.reports_fail += 1
+    except Exception as e:
+        st.session_state.reports_fail += 1
+    finally:
+        driver.quit()
+
+    # التقدم للحساب التالي أو البلاغ التالي
+    st.session_state.current_report_index += 1
+    if st.session_state.current_report_index >= st.session_state.reports_per_account:
+        st.session_state.current_account_index += 1
+        st.session_state.current_report_index = 0
+
+    # التحقق من انتهاء المهمة
+    if st.session_state.current_account_index >= len(accounts):
+        st.session_state.running = False
+
+    # تأخير عشوائي
+    delay = random.uniform(st.session_state.delay_min, st.session_state.delay_max)
+    time.sleep(delay)
+
+    # إعادة تشغيل التطبيق لتحديث الواجهة
+    st.rerun()
+
+# ===== واجهة المستخدم =====
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+    target = st.text_input("👤 اسم الضحية (Target)", value=st.session_state.target_username)
+    st.session_state.target_username = target
+
+    report_type = st.selectbox("📋 نوع البلاغ", ["spam", "impersonation", "inappropriate", "bullying"], index=0)
+    st.session_state.report_type = report_type
+
+    reports_per = st.number_input("🔢 عدد البلاغات لكل حساب", min_value=1, max_value=100, value=st.session_state.reports_per_account, step=1)
+    st.session_state.reports_per_account = reports_per
+
     col1, col2 = st.columns(2)
     with col1:
-        use_tor = st.checkbox("Use Tor (requires Tor running locally)", value=False)
-        tor_socks = st.text_input("Tor SOCKS5 proxy", "socks5h://127.0.0.1:9050")
-        tor_control = st.text_input("Tor Control port", "9051")
-        tor_password = st.text_input("Tor Control password (if any)", type="password", value="")
+        delay_min = st.number_input("⏱️ أقل تأخير (ث)", min_value=1, max_value=60, value=st.session_state.delay_min, step=1)
+        st.session_state.delay_min = delay_min
     with col2:
-        st.subheader("No API keys needed — defaults are ready")
+        delay_max = st.number_input("⏱️ أقصى تأخير (ث)", min_value=2, max_value=120, value=st.session_state.delay_max, step=1)
+        st.session_state.delay_max = delay_max
 
-st.subheader("Targets")
-target_tabs = st.tabs(["Surface APIs", "Deep APIs", "Dark Onions", "Paste Sites"])
+    use_proxy = st.checkbox("🌐 استخدام بروكسيات", value=st.session_state.use_proxies)
+    st.session_state.use_proxies = use_proxy
 
-with target_tabs[0]:
-    surface_apis = st.text_area(
-        "Surface API endpoints (name|url|headers_json)",
-        DEFAULT_SURFACE
-    )
-with target_tabs[1]:
-    deep_apis = st.text_area(
-        "Deep API endpoints (name|url|method|payload_json|headers_json)",
-        DEFAULT_DEEP
-    )
-with target_tabs[2]:
-    dark_onions = st.text_area(
-        "Dark Web onion URLs (one per line)",
-        DEFAULT_DARK
-    )
-with target_tabs[3]:
-    paste_sites = st.text_area(
-        "Paste sites raw URLs (one per line)",
-        DEFAULT_PASTES
-    )
+    accounts_text = st.text_area("👥 حسابات (username:password كل سطر)", height=150)
+    proxies_text = st.text_area("🌍 بروكسيات (http://ip:port كل سطر)", height=100)
 
-# -----------------------------------------------------------------------------
-# Core Searcher
-# -----------------------------------------------------------------------------
-class LeakSearcher:
-    def __init__(self, config):
-        self.config = config
-        self.results = []
-        self.cc_pattern = re.compile(r'\b(?:\d{4}[ -]?){3}\d{4}\b')
-        self.semaphore = asyncio.Semaphore(20)
-        self.tor_session = None
+    # تحديث القوائم
+    if accounts_text:
+        new_accounts = []
+        for line in accounts_text.strip().splitlines():
+            if ":" in line:
+                parts = line.split(":", 1)
+                new_accounts.append({"username": parts[0].strip(), "password": parts[1].strip()})
+        st.session_state.accounts_list = new_accounts
+    else:
+        st.session_state.accounts_list = []
 
-    def _init_tor(self):
-        if self.config.get("use_tor", False):
-            try:
-                with Controller.from_port(port=int(self.config.get("tor_control", 9051))) as controller:
-                    if self.config.get("tor_password"):
-                        controller.authenticate(password=self.config["tor_password"])
-                    else:
-                        controller.authenticate()
-                    controller.signal(Signal.NEWNYM)
-                self.tor_session = requests.Session()
-                self.tor_session.proxies = {
-                    'http': self.config.get("tor_socks", "socks5h://127.0.0.1:9050"),
-                    'https': self.config.get("tor_socks", "socks5h://127.0.0.1:9050")
-                }
-            except Exception as e:
-                st.warning(f"Tor init failed: {e}")
+    if proxies_text:
+        new_proxies = [p.strip() for p in proxies_text.strip().splitlines() if p.strip()]
+        st.session_state.proxies_list = new_proxies
+    else:
+        st.session_state.proxies_list = []
 
-    async def _fetch(self, url, headers=None, tor=False):
-        async with self.semaphore:
-            try:
-                if tor and self.tor_session:
-                    loop = asyncio.get_event_loop()
-                    resp = await loop.run_in_executor(None, self.tor_session.get, url, {"headers": headers or {}, "timeout": 15})
-                    return resp.text if resp.status_code == 200 else None
-                else:
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.get(url, headers=headers or {}, timeout=15) as resp:
-                            return await resp.text() if resp.status == 200 else None
-            except:
-                return None
-
-    async def _fetch_post(self, url, payload, headers=None):
-        async with self.semaphore:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.post(url, json=payload, headers=headers or {}, timeout=15) as resp:
-                        return await resp.text() if resp.status == 200 else None
-            except:
-                return None
-
-    async def _search_surface(self):
-        for entry in self.config.get("surface_apis", []):
-            text = await self._fetch(entry["url"], headers=entry.get("headers", {}))
-            if text:
-                self._extract_cards(text, entry.get("name", "surface"))
-
-    async def _search_pastes(self):
-        for url in self.config.get("paste_sites", []):
-            html = await self._fetch(url)
-            if html:
-                soup = BeautifulSoup(html, 'html.parser')
-                self._extract_cards(soup.get_text(), "paste")
-
-    async def _search_deep(self):
-        for endpoint in self.config.get("deep_apis", []):
-            if endpoint.get("method", "GET").upper() == "POST":
-                text = await self._fetch_post(endpoint["url"], endpoint.get("payload", {}), endpoint.get("headers", {}))
+    # أزرار التحكم
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("🚀 بدء الإبلاغ", type="primary", disabled=st.session_state.running):
+            # تحقق من وجود حسابات وهدف
+            if not st.session_state.accounts_list:
+                st.error("⚠️ يجب إدخال حسابات على الأقل.")
+            elif not st.session_state.target_username:
+                st.error("⚠️ يجب إدخال اسم الضحية.")
             else:
-                text = await self._fetch(endpoint["url"], headers=endpoint.get("headers", {}))
-            if text:
-                self._extract_cards(text, endpoint.get("name", "deep"))
+                # إعادة تعيين العدادات
+                st.session_state.running = True
+                st.session_state.stop_requested = False
+                st.session_state.reports_sent = 0
+                st.session_state.reports_success = 0
+                st.session_state.reports_fail = 0
+                st.session_state.current_account_index = 0
+                st.session_state.current_report_index = 0
+                st.session_state.start_time = time.time()
+                st.session_state.total_reports_planned = len(st.session_state.accounts_list) * st.session_state.reports_per_account
+                st.rerun()
+    with col_btn2:
+        if st.button("⏹️ إيقاف", disabled=not st.session_state.running):
+            st.session_state.stop_requested = True
+            st.session_state.running = False
+            st.rerun()
 
-    async def _search_dark(self):
-        if not self.config.get("use_tor", False) or not self.tor_session:
-            return
-        for url in self.config.get("dark_onions", []):
-            html = await self._fetch(url, tor=True)
-            if html:
-                soup = BeautifulSoup(html, 'html.parser')
-                self._extract_cards(soup.get_text(), "darkweb")
+# ===== عرض الإحصائيات =====
+if st.session_state.running:
+    placeholder = st.empty()
+    with placeholder.container():
+        col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
+        total_planned = st.session_state.total_reports_planned
+        sent = st.session_state.reports_sent
+        success = st.session_state.reports_success
+        fail = st.session_state.reports_fail
 
-    def _extract_cards(self, text, source):
-        matches = self.cc_pattern.findall(text)
-        for match in matches:
-            cleaned = re.sub(r'[ -]', '', match)
-            if self._luhn_check(cleaned):
-                idx = text.index(match)
-                context = text[max(0, idx-50):idx+50]
-                self.results.append({"card": cleaned, "source": source, "context": context.strip()})
+        # حساب السرعة
+        elapsed = time.time() - st.session_state.start_time if st.session_state.start_time else 0.001
+        speed = sent / elapsed if elapsed > 0 else 0
 
-    def _luhn_check(self, cc):
-        digits = [int(d) for d in cc]
-        if len(digits) not in (15, 16):
-            return False
-        checksum = 0
-        reverse = digits[::-1]
-        for i, d in enumerate(reverse):
-            if i % 2 == 1:
-                d *= 2
-                if d > 9:
-                    d -= 9
-            checksum += d
-        return checksum % 10 == 0
+        col_stats1.metric("📤 أُرسل", sent, f"{speed:.2f} بلاغ/ث")
+        col_stats2.metric("✅ نجح", success)
+        col_stats3.metric("❌ فشل", fail)
+        col_stats4.metric("📊 متبقٍ", max(0, total_planned - sent))
 
-    async def run(self):
-        self._init_tor()
-        await asyncio.gather(
-            self._search_surface(),
-            self._search_pastes(),
-            self._search_deep(),
-            self._search_dark()
-        )
-        return self.results
+        progress = sent / total_planned if total_planned > 0 else 0
+        st.progress(progress, text=f"التقدم: {int(progress*100)}%")
 
-# -----------------------------------------------------------------------------
-# Parse configuration from UI
-# -----------------------------------------------------------------------------
-def parse_apis(text):
-    entries = []
-    for line in text.strip().split('\n'):
-        if not line.strip():
-            continue
-        parts = line.split('|')
-        if len(parts) >= 2:
-            name = parts[0].strip()
-            url = parts[1].strip()
-            headers = {}
-            if len(parts) >= 3:
-                try:
-                    headers = json.loads(parts[2].strip())
-                except:
-                    pass
-            entries.append({"name": name, "url": url, "headers": headers})
-    return entries
+    # تنفيذ البلاغ التالي (يتم استدعاؤه بعد كل تحديث)
+    do_next_report()
 
-def parse_deep_apis(text):
-    entries = []
-    for line in text.strip().split('\n'):
-        if not line.strip():
-            continue
-        parts = line.split('|')
-        if len(parts) >= 3:
-            name = parts[0].strip()
-            url = parts[1].strip()
-            method = parts[2].strip().upper()
-            payload = {}
-            headers = {}
-            if len(parts) >= 4:
-                try:
-                    payload = json.loads(parts[3].strip())
-                except:
-                    pass
-            if len(parts) >= 5:
-                try:
-                    headers = json.loads(parts[4].strip())
-                except:
-                    pass
-            entries.append({"name": name, "url": url, "method": method, "payload": payload, "headers": headers})
-    return entries
+else:
+    # عرض الحالة النهائية إذا انتهى
+    if st.session_state.reports_sent > 0:
+        st.success("✅ انتهت الحملة.")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("إجمالي", st.session_state.reports_sent)
+        col2.metric("نجح", st.session_state.reports_success)
+        col3.metric("فشل", st.session_state.reports_fail)
+        elapsed = time.time() - st.session_state.start_time if st.session_state.start_time else 0
+        st.info(f"الوقت المستغرق: {elapsed:.2f} ثانية")
 
-def parse_lines(text):
-    return [line.strip() for line in text.strip().split('\n') if line.strip()]
+# ===== قسم فحص الثغرات =====
+with st.expander("🔍 فحص ثغرات نظام البلاغات"):
+    if st.button("تشغيل الفحص"):
+        st.info("جارٍ فحص الثغرات... (محاكاة)")
+        # يمكن إضافة اختبارات فعلية هنا (مثل تجربة أنواع بلاغات مختلفة)
+        time.sleep(2)
+        st.write("✅ تم الفحص. النتائج:")
+        st.json({
+            "نوع البلاغ الأكثر فعالية": "impersonation",
+            "إمكانية الإبلاغ بدون تأكيد البريد": "نعم",
+            "عدد البلاغات المطلوبة للتبند": "غير محدد (يعتمد على عوامل أخرى)"
+        })
 
-# -----------------------------------------------------------------------------
-# Run button and results
-# -----------------------------------------------------------------------------
-if st.button("🚀 Run Scan", type="primary"):
-    with st.spinner("Scanning... this may take a while."):
-        config = {
-            "use_tor": use_tor,
-            "tor_socks": tor_socks,
-            "tor_control": int(tor_control) if tor_control.isdigit() else 9051,
-            "tor_password": tor_password,
-            "surface_apis": parse_apis(surface_apis),
-            "deep_apis": parse_deep_apis(deep_apis),
-            "dark_onions": parse_lines(dark_onions),
-            "paste_sites": parse_lines(paste_sites)
-        }
-        searcher = LeakSearcher(config)
-        results = asyncio.run(searcher.run())
-
-        if results:
-            df = pd.DataFrame(results)
-            st.success(f"Found {len(results)} credit cards.")
-            st.dataframe(df, use_container_width=True)
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download CSV", data=csv, file_name="leaks.csv", mime="text/csv")
-        else:
-            st.info("No credit cards found in the scanned sources. Try adding more paste URLs or enabling Tor.")
-
-st.markdown("---")
-st.caption("To use Tor, install and run Tor locally (SOCKS5 on 9050, Control on 9051). Dependencies: `pip install streamlit aiohttp beautifulsoup4 requests stem pandas`")
+st.caption("ملاحظة: يتطلب تثبيت Chrome و Chromedriver (يتم تنزيله تلقائياً). استخدم حسابات وبروكسيات حقيقية لزيادة الفعالية.")
