@@ -1,16 +1,22 @@
 import streamlit as st
-import paramiko
 import threading
 import time
 import os
-import subprocess
-import io
-import sys
+
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
 
 st.set_page_config(page_title="WiFi Attack Controller", layout="wide")
 
 st.title("WiFi Attack Controller")
 st.info("For authorized security testing only. Use only on networks you own or have explicit permission to test.")
+
+if not PARAMIKO_AVAILABLE:
+    st.error("Paramiko is not installed. Please add 'paramiko' to your requirements.txt and redeploy.")
+    st.stop()
 
 if "ssh" not in st.session_state:
     st.session_state.ssh = None
